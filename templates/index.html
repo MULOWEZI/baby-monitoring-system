@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Baby Cradle Monitoring System - Dashboard</title>
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#F6F8FC; --surface:#FFFFFF; --border:#E6EBF5;
+  --primary:#3457D5; --primary-dark:#24408F; --primary-light:#EEF2FF;
+  --text-primary:#131B2E; --text-secondary:#4B5875; --text-muted:#8A94A6;
+  --success:#12A150; --success-bg:#E7F8EE;
+  --warning:#D97706; --warning-bg:#FFF4E5;
+  --critical:#E11D48; --critical-bg:#FDE8ED;
+  --radius:18px; --radius-sm:12px;
+  --shadow: 0 1px 2px rgba(19,27,46,.04), 0 8px 24px rgba(19,27,46,.05);
+  --shadow-hover: 0 4px 10px rgba(19,27,46,.06), 0 16px 36px rgba(19,27,46,.08);
+  --transition: all .2s cubic-bezier(.4,0,.2,1);
+  --sidebar-width: 252px;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text-primary);min-height:100vh;display:flex;}
+h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta Sans','Inter',sans-serif;}
+
+.sidebar{position:fixed;top:0;left:0;width:var(--sidebar-width);height:100vh;background:var(--surface);border-right:1px solid var(--border);padding:24px 18px;display:flex;flex-direction:column;z-index:100;transition:var(--transition);}
+.sidebar-brand{display:flex;align-items:center;gap:12px;padding-bottom:22px;margin-bottom:18px;border-bottom:1px solid var(--border);}
+.sidebar-brand .logo{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,var(--primary),#6C8CFF);font-size:1.15rem;box-shadow:0 6px 16px rgba(52,87,213,.28);flex-shrink:0;}
+.sidebar-brand .brand-text h2{font-size:.98rem;font-weight:700;color:var(--text-primary);line-height:1.2;}
+.sidebar-brand .brand-text small{display:block;color:var(--text-muted);font-size:.63rem;font-weight:500;margin-top:1px;}
+.nav-label{color:var(--text-muted);font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:1px;padding:0 12px;margin-bottom:10px;}
+.sidebar-nav{display:flex;flex-direction:column;gap:3px;flex:1;}
+.nav-link{color:var(--text-secondary);text-decoration:none;padding:11px 14px;border-radius:12px;font-weight:600;font-size:.85rem;display:flex;align-items:center;gap:12px;transition:var(--transition);position:relative;}
+.nav-link i{width:18px;font-size:.95rem;}
+.nav-link:hover{background:var(--primary-light);color:var(--primary-dark);}
+.nav-link.active{background:var(--primary);color:#fff;box-shadow:0 6px 16px rgba(52,87,213,.28);}
+.sidebar-footer{border-top:1px solid var(--border);padding-top:16px;margin-top:14px;}
+.status-indicator{display:flex;align-items:center;gap:8px;font-size:.72rem;font-weight:600;color:var(--text-secondary);padding:6px 4px;background:var(--success-bg);border-radius:10px;padding:8px 12px;}
+.status-indicator .dot{width:7px;height:7px;border-radius:50%;background:var(--success);animation:pulse-dot 2s infinite;}
+.status-indicator.stale{background:var(--warning-bg);color:#8A5C08;}
+.status-indicator.stale .dot{background:var(--warning);}
+.status-indicator.offline{background:var(--critical-bg);color:#9A1236;}
+.status-indicator.offline .dot{background:var(--critical);animation:none;}
+@keyframes pulse-dot{0%,100%{opacity:1;}50%{opacity:.35;}}
+.version{font-size:.6rem;color:var(--text-muted);margin-top:8px;padding:0 4px;}
+
+.main-content{margin-left:var(--sidebar-width);flex:1;padding:28px 32px 32px;min-height:100vh;}
+.top-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:24px;}
+.top-bar .page-title h1{font-size:1.4rem;font-weight:700;}
+.top-bar .page-title p{font-size:.8rem;color:var(--text-muted);margin-top:3px;}
+.live-chip{display:flex;align-items:center;gap:8px;font-size:.68rem;font-weight:700;color:var(--primary);background:var(--primary-light);padding:8px 16px 8px 12px;border-radius:30px;text-transform:uppercase;letter-spacing:.5px;}
+.live-chip.stale{color:#8A5C08;background:var(--warning-bg);}
+.live-chip .pulse-dot{width:7px;height:7px;border-radius:50%;background:currentColor;animation:pulse 1.8s infinite;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,87,213,.4);}70%{box-shadow:0 0 0 8px rgba(52,87,213,0);}100%{box-shadow:0 0 0 0 rgba(52,87,213,0);}}
+
+.sensor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px;}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);transition:var(--transition);}
+.card:hover{box-shadow:var(--shadow-hover);transform:translateY(-3px);}
+.card-top{display:flex;align-items:center;gap:12px;margin-bottom:14px;}
+.card-icon{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;font-size:1.05rem;background:var(--primary-light);}
+.card-title{color:var(--text-muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.7px;font-weight:700;}
+.card-value{font-size:2rem;font-weight:800;letter-spacing:-.6px;color:var(--text-primary);}
+.card-unit{font-size:.85rem;color:var(--text-muted);font-weight:600;margin-left:3px;}
+.card-status{display:inline-flex;align-items:center;gap:5px;margin-top:10px;padding:4px 12px;border-radius:30px;font-size:.65rem;font-weight:700;}
+.status-normal{background:var(--success-bg);color:var(--success);}
+.status-warning{background:var(--warning-bg);color:var(--warning);}
+.status-critical{background:var(--critical-bg);color:var(--critical);}
+
+.row-2col{display:grid;grid-template-columns:1fr 1.3fr;gap:18px;margin-bottom:24px;}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px 22px 22px;box-shadow:var(--shadow);}
+.panel-header{display:flex;align-items:center;gap:10px;margin-bottom:16px;}
+.panel-header .dot-accent{width:9px;height:9px;border-radius:50%;background:var(--primary);flex-shrink:0;}
+.panel-header h2{font-size:1rem;font-weight:700;}
+.panel-header .sub{margin-left:auto;font-size:.7rem;color:var(--text-muted);font-weight:600;}
+
+.video-box{border-radius:14px;overflow:hidden;background:#0F1523;aspect-ratio:16/9;border:1px solid var(--border);position:relative;}
+.video-box img{width:100%;height:100%;object-fit:contain;display:block;}
+.video-empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:rgba(255,255,255,.4);font-size:.8rem;}
+.video-empty .big{font-size:2rem;opacity:.5;}
+.video-link{display:block;text-align:center;margin-top:12px;font-size:.78rem;color:var(--primary);text-decoration:none;font-weight:700;}
+.video-link:hover{text-decoration:underline;}
+
+.chart-wrap{position:relative;height:254px;}
+.panel-full{margin-bottom:24px;}
+.alert-item{padding:13px 16px;margin-bottom:9px;border-radius:14px;background:var(--bg);border:1px solid var(--border);animation:slideIn .3s ease;}
+@keyframes slideIn{from{opacity:0;transform:translateX(-12px);}to{opacity:1;transform:translateX(0);}}
+.alert-critical{border-left:4px solid var(--critical);}
+.alert-warning{border-left:4px solid var(--warning);}
+.alert-info{border-left:4px solid var(--primary);}
+.alert-type{font-weight:800;text-transform:uppercase;font-size:.64rem;letter-spacing:.6px;}
+.alert-critical .alert-type{color:var(--critical);}
+.alert-warning .alert-type{color:var(--warning);}
+.alert-info .alert-type{color:var(--primary);}
+.alert-msg{margin:4px 0 3px;font-size:.85rem;font-weight:500;}
+.alert-time{font-size:.64rem;color:var(--text-muted);}
+
+.chat-messages{height:175px;overflow-y:auto;margin-bottom:12px;padding:14px;background:var(--bg);border-radius:14px;display:flex;flex-direction:column;gap:8px;}
+.chat-msg{padding:9px 15px;border-radius:14px;max-width:85%;line-height:1.5;font-size:.83rem;}
+.chat-user{background:var(--primary);color:#fff;align-self:flex-end;border-bottom-right-radius:4px;}
+.chat-bot{background:var(--surface);align-self:flex-start;border-bottom-left-radius:4px;border:1px solid var(--border);}
+.chat-bot strong{color:var(--primary);}
+.chat-input-row{display:flex;gap:9px;}
+.chat-input-row input{flex:1;padding:11px 16px;border:1px solid var(--border);border-radius:12px;background:var(--bg);color:var(--text-primary);font-size:.83rem;outline:none;font-family:inherit;transition:var(--transition);}
+.chat-input-row input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-light);}
+.btn{background:var(--primary);color:#fff;border:none;padding:11px 22px;border-radius:12px;cursor:pointer;font-weight:700;font-size:.82rem;font-family:inherit;transition:var(--transition);white-space:nowrap;}
+.btn:hover{background:var(--primary-dark);transform:translateY(-1px);}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+.empty{color:var(--text-muted);font-size:.83rem;padding:6px 0;}
+.footer{text-align:center;color:var(--text-muted);font-size:.7rem;padding:18px 0 4px;border-top:1px solid var(--border);margin-top:8px;}
+.footer span{color:var(--text-secondary);font-weight:600;}
+::-webkit-scrollbar{width:5px;height:5px;}
+::-webkit-scrollbar-track{background:var(--bg);border-radius:10px;}
+::-webkit-scrollbar-thumb{background:#CBD5EA;border-radius:10px;}
+
+@media(max-width:992px){
+  :root{--sidebar-width:0px;}
+  .sidebar{transform:translateX(-100%);width:270px;box-shadow:4px 0 40px rgba(0,0,0,.1);}
+  .sidebar.open{transform:translateX(0);}
+  .main-content{margin-left:0;padding:18px 16px 22px;}
+  .hamburger{display:flex !important;}
+  .sensor-grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;}
+  .row-2col{grid-template-columns:1fr;}
+  .card-value{font-size:1.6rem;}
+}
+.hamburger{display:none;background:none;border:none;font-size:1.3rem;color:var(--text-primary);cursor:pointer;padding:5px;border-radius:8px;}
+.hamburger:hover{background:var(--primary-light);}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(19,27,46,.35);z-index:99;backdrop-filter:blur(3px);}
+.sidebar-overlay.active{display:block;}
+@media(max-width:480px){
+  .top-bar .page-title h1{font-size:1.1rem;}
+  .sensor-grid{grid-template-columns:1fr 1fr;gap:8px;}
+  .card{padding:13px;}
+  .card-value{font-size:1.4rem;}
+  .panel{padding:16px 14px;}
+  .chart-wrap{height:200px;}
+  .chat-messages{height:145px;}
+}
+</style>
+</head>
+<body>
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-brand">
+    <div class="logo">🚼</div>
+    <div class="brand-text"><h2>Baby Cradle</h2><small>Smart Monitoring</small></div>
+  </div>
+  <div class="nav-label">Menu</div>
+  <nav class="sidebar-nav">
+    <a href="/" class="nav-link active"><i>📊</i> Dashboard</a>
+    <a href="/live" class="nav-link"><i>📷</i> Live Video</a>
+    <a href="/history" class="nav-link"><i>📈</i> History</a>
+  </nav>
+  <div class="sidebar-footer">
+    <div class="status-indicator" id="conn-indicator"><span class="dot"></span><span id="conn-status">Connecting…</span></div>
+    <div class="version">v3.0.0</div>
+  </div>
+</aside>
+<div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+<main class="main-content">
+  <div class="top-bar">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <button class="hamburger" id="hamburgerBtn" aria-label="Toggle sidebar">☰</button>
+      <div class="page-title"><h1>Dashboard</h1><p>Real-time baby monitoring overview</p></div>
+    </div>
+    <div class="live-chip" id="liveChip"><span class="pulse-dot"></span><span id="liveChipText">Live</span></div>
+  </div>
+
+  <div class="sensor-grid">
+    <div class="card">
+      <div class="card-top"><div class="card-icon">🌡️</div><div class="card-title">Temperature</div></div>
+      <div><span id="temp" class="card-value">--</span><span class="card-unit">°C</span></div>
+      <div id="temp-status" class="card-status status-normal">Waiting...</div>
+    </div>
+    <div class="card">
+      <div class="card-top"><div class="card-icon">💧</div><div class="card-title">Humidity</div></div>
+      <div><span id="humidity" class="card-value">--</span><span class="card-unit">%</span></div>
+      <div id="humidity-status" class="card-status status-normal">Waiting...</div>
+    </div>
+    <div class="card">
+      <div class="card-top"><div class="card-icon">🏃</div><div class="card-title">Motion</div></div>
+      <div><span id="motion" class="card-value" style="font-size:1.3rem;">--</span></div>
+      <div id="motion-status" class="card-status status-normal">Waiting...</div>
+    </div>
+    <div class="card">
+      <div class="card-top"><div class="card-icon">🔊</div><div class="card-title">Sound</div></div>
+      <div><span id="sound" class="card-value" style="font-size:1.3rem;">--</span></div>
+      <div id="sound-status" class="card-status status-normal">Waiting...</div>
+    </div>
+    <div class="card">
+      <div class="card-top"><div class="card-icon">🚼</div><div class="card-title">Diaper</div></div>
+      <div><span id="wetness" class="card-value" style="font-size:1.3rem;">--</span></div>
+      <div id="wetness-status" class="card-status status-normal">Waiting...</div>
+    </div>
+  </div>
+
+  <div class="row-2col">
+    <div class="panel">
+      <div class="panel-header"><span class="dot-accent"></span><h2>Live Camera</h2><span class="sub">Real-time feed</span></div>
+      <div class="video-box">
+        <img src="/video_feed" alt="Live Camera" id="dashCam" style="display:none;">
+        <div class="video-empty" id="dashCamEmpty"><div class="big">📷</div><div>Waiting for camera feed...</div></div>
+      </div>
+      <a href="/live" class="video-link">Open full live view →</a>
+    </div>
+    <div class="panel">
+      <div class="panel-header"><span class="dot-accent"></span><h2>Live Sensor Trends</h2><span class="sub">Last 60 readings</span></div>
+      <div class="chart-wrap"><canvas id="sensorChart"></canvas></div>
+    </div>
+  </div>
+
+  <div class="panel panel-full">
+    <div class="panel-header"><span class="dot-accent"></span><h2>Recent Alerts</h2><span class="sub" id="alert-count">0 alerts</span></div>
+    <div id="alerts-list"></div>
+    <button class="btn" id="clearAlertsBtn" onclick="clearAlerts()" style="margin-top:14px;">Clear All Alerts</button>
+  </div>
+
+  <div class="panel panel-full">
+    <div class="panel-header"><span class="dot-accent"></span><h2>Assistant</h2><span class="sub">Ask about baby's status</span></div>
+    <div class="chat-messages" id="chatMessages">
+      <div class="chat-msg chat-bot">Hello! Ask me about <strong>temperature</strong>, <strong>humidity</strong>, <strong>motion</strong>, <strong>sound</strong>, or <strong>diaper</strong> status.</div>
+    </div>
+    <div class="chat-input-row">
+      <input type="text" id="chatInput" placeholder="Ask about baby's status..." onkeydown="if(event.key==='Enter') sendChat()">
+      <button class="btn" onclick="sendChat()">Send</button>
+    </div>
+  </div>
+
+  <div class="footer">Last update: <span id="last-update">--</span> &middot; <span>Baby Cradle Monitoring System</span></div>
+</main>
+
+<script>
+const socket = io();
+let lastUpdateTs = null;
+
+const hamburger = document.getElementById('hamburgerBtn');
+const sidebar = document.getElementById('sidebar');
+const overlay = document.getElementById('sidebarOverlay');
+function toggleSidebar(){ sidebar.classList.toggle('open'); overlay.classList.toggle('active'); document.body.style.overflow = sidebar.classList.contains('open') ? 'hidden' : ''; }
+hamburger.addEventListener('click', toggleSidebar);
+overlay.addEventListener('click', toggleSidebar);
+document.querySelectorAll('.sidebar-nav a').forEach(link=>{
+  link.addEventListener('click', ()=>{ if(window.innerWidth<=992){ sidebar.classList.remove('open'); overlay.classList.remove('active'); document.body.style.overflow=''; } });
+});
+
+const ctx = document.getElementById('sensorChart').getContext('2d');
+const chart = new Chart(ctx, {
+  type:'line',
+  data:{ labels:[], datasets:[
+    { label:'Temperature (°C)', data:[], borderColor:'#3457D5', backgroundColor:'rgba(52,87,213,.07)', tension:.3, yAxisID:'y', pointRadius:0, borderWidth:2.5, fill:true },
+    { label:'Humidity (%)', data:[], borderColor:'#6C8CFF', backgroundColor:'rgba(108,140,255,.07)', tension:.3, yAxisID:'y1', pointRadius:0, borderWidth:2.5, fill:true }
+  ]},
+  options:{
+    responsive:true, maintainAspectRatio:false, interaction:{mode:'index', intersect:false},
+    plugins:{ legend:{ labels:{ color:'#4B5875', font:{family:'Inter', weight:'600', size:10}, padding:14, usePointStyle:true, pointStyle:'circle' } } },
+    scales:{
+      x:{ ticks:{ color:'#8A94A6', font:{family:'Inter', size:8}, maxTicksLimit:12 }, grid:{ color:'rgba(52,87,213,.04)' } },
+      y:{ type:'linear', position:'left', title:{ display:true, text:'°C', color:'#8A94A6', font:{family:'Inter', weight:'600', size:9} }, min:0, max:40, ticks:{ color:'#8A94A6', font:{family:'Inter', size:8} }, grid:{ color:'rgba(52,87,213,.04)' } },
+      y1:{ type:'linear', position:'right', title:{ display:true, text:'%', color:'#8A94A6', font:{family:'Inter', weight:'600', size:9} }, min:0, max:100, grid:{ drawOnChartArea:false }, ticks:{ color:'#8A94A6', font:{family:'Inter', size:8} } }
+    }
+  }
+});
+
+function getStatusClass(value,min,max){ if(value==null) return 'status-normal'; if(value<min||value>max) return 'status-critical'; if(value<min+2||value>max-2) return 'status-warning'; return 'status-normal'; }
+function escapeHtml(text){ const d=document.createElement('div'); d.textContent=text; return d.innerHTML; }
+
+function applySensorData(data){
+  document.getElementById('temp').textContent = data.temperature || '--';
+  document.getElementById('humidity').textContent = data.humidity || '--';
+  document.getElementById('motion').textContent = data.motion ? 'Active' : 'Quiet';
+  document.getElementById('sound').textContent = data.sound ? 'Loud' : 'Quiet';
+  document.getElementById('wetness').textContent = data.wetness ? 'Wet' : 'Dry';
+  document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+
+  const tempClass = getStatusClass(data.temperature,20,25);
+  const tempEl = document.getElementById('temp-status');
+  tempEl.className = `card-status ${tempClass}`;
+  tempEl.textContent = tempClass==='status-critical' ? '⚠ Out of range' : tempClass==='status-warning' ? '⚠ Near limit' : '✅ Normal';
+
+  const humClass = getStatusClass(data.humidity,40,60);
+  const humEl = document.getElementById('humidity-status');
+  humEl.className = `card-status ${humClass}`;
+  humEl.textContent = humClass==='status-critical' ? '⚠ Out of range' : humClass==='status-warning' ? '⚠ Near limit' : '✅ Normal';
+
+  const motionEl = document.getElementById('motion-status');
+  motionEl.className = `card-status ${data.motion ? 'status-warning' : 'status-normal'}`;
+  motionEl.textContent = data.motion ? '🔴 Baby moving' : '✅ No motion';
+
+  const soundEl = document.getElementById('sound-status');
+  soundEl.className = `card-status ${data.sound ? 'status-warning' : 'status-normal'}`;
+  soundEl.textContent = data.sound ? '🔊 Loud noise' : '✅ Quiet';
+
+  const wetEl = document.getElementById('wetness-status');
+  wetEl.className = `card-status ${data.wetness ? 'status-warning' : 'status-normal'}`;
+  wetEl.textContent = data.wetness ? '🔄 Needs changing' : '✅ Dry';
+}
+
+function pushChartPoint(data){
+  if(chart.data.labels.length>60){ chart.data.labels.shift(); chart.data.datasets[0].data.shift(); chart.data.datasets[1].data.shift(); }
+  chart.data.labels.push(new Date().toLocaleTimeString());
+  chart.data.datasets[0].data.push(data.temperature);
+  chart.data.datasets[1].data.push(data.humidity);
+  chart.update();
+}
+
+async function loadCurrentData(){
+  try{
+    const r = await fetch('/api/current_data');
+    const data = await r.json();
+    applySensorData(data);
+    if(data.last_update) lastUpdateTs = new Date(data.last_update).getTime();
+  }catch(e){ console.error(e); }
+}
+
+async function loadHistory(){
+  try{
+    const response = await fetch('/api/history?limit=50');
+    const data = await response.json();
+    if(data && data.length>0){
+      const reversed = data.reverse();
+      chart.data.labels = reversed.map(d=>new Date(d.created_at).toLocaleTimeString());
+      chart.data.datasets[0].data = reversed.map(d=>d.temperature);
+      chart.data.datasets[1].data = reversed.map(d=>d.humidity);
+      chart.update();
+    }
+  }catch(e){ console.error(e); }
+}
+
+async function loadAlerts(){
+  try{
+    const response = await fetch('/api/alerts?limit=20');
+    const alerts = await response.json();
+    const alertsList = document.getElementById('alerts-list');
+    const alertCount = document.getElementById('alert-count');
+    if(alerts && alerts.length>0){
+      alertCount.textContent = `${alerts.length} alerts`;
+      alertsList.innerHTML = alerts.map(alert=>`
+        <div class="alert-item alert-${alert.severity}">
+          <div class="alert-type">${alert.alert_type}</div>
+          <div class="alert-msg">${escapeHtml(alert.message)}</div>
+          <div class="alert-time">${new Date(alert.created_at).toLocaleString()}</div>
+        </div>`).join('');
+    } else {
+      alertCount.textContent = '0 alerts';
+      alertsList.innerHTML = '<div class="empty">✨ No alerts yet. Everything is fine!</div>';
+    }
+  }catch(e){ console.error(e); }
+}
+
+async function clearAlerts(){
+  const btn = document.getElementById('clearAlertsBtn');
+  btn.disabled = true; btn.textContent = 'Clearing…';
+  try{ await fetch('/api/clear_alerts', {method:'POST'}); await loadAlerts(); }
+  finally{ btn.disabled = false; btn.textContent = 'Clear All Alerts'; }
+}
+
+async function sendChat(){
+  const input = document.getElementById('chatInput');
+  const msg = input.value.trim();
+  if(!msg) return;
+  input.value = '';
+  const msgs = document.getElementById('chatMessages');
+  msgs.innerHTML += `<div class="chat-msg chat-user">${escapeHtml(msg)}</div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+  try{
+    const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
+    const data = await r.json();
+    msgs.innerHTML += `<div class="chat-msg chat-bot">${data.reply}</div>`;
+  }catch(e){
+    msgs.innerHTML += `<div class="chat-msg chat-bot">Sorry, I couldn't reach the server.</div>`;
+  }
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+socket.on('sensor_update', (data)=>{ applySensorData(data); pushChartPoint(data); lastUpdateTs = Date.now(); });
+socket.on('new_alert', ()=>{ loadAlerts(); });
+
+const connIndicator = document.getElementById('conn-indicator');
+const connStatus = document.getElementById('conn-status');
+const liveChip = document.getElementById('liveChip');
+const liveChipText = document.getElementById('liveChipText');
+
+socket.on('disconnect', ()=>{
+  connIndicator.className='status-indicator offline'; connStatus.textContent='Offline';
+  liveChip.classList.add('stale'); liveChipText.textContent='Disconnected';
+});
+socket.on('connect', ()=>{
+  connIndicator.className='status-indicator'; connStatus.textContent='Online';
+  liveChip.classList.remove('stale'); liveChipText.textContent='Live';
+});
+
+setInterval(()=>{
+  if(!socket.connected) return;
+  if(lastUpdateTs && (Date.now()-lastUpdateTs)>10000){
+    connIndicator.className='status-indicator stale'; connStatus.textContent='Feed delayed';
+    liveChip.classList.add('stale'); liveChipText.textContent='Delayed';
+  } else if(lastUpdateTs){
+    connIndicator.className='status-indicator'; connStatus.textContent='Online';
+    liveChip.classList.remove('stale'); liveChipText.textContent='Live';
+  }
+}, 3000);
+
+const dashCam = document.getElementById('dashCam');
+const dashCamEmpty = document.getElementById('dashCamEmpty');
+dashCam.onload = ()=>{ dashCam.style.display='block'; dashCamEmpty.style.display='none'; };
+dashCam.onerror = ()=>{ dashCam.style.display='none'; dashCamEmpty.style.display='flex'; };
+
+loadCurrentData();
+loadHistory();
+loadAlerts();
+setInterval(()=>{ loadHistory(); loadAlerts(); }, 30000);
+</script>
+</body>
+</html>

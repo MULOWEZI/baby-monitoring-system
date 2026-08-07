@@ -1,0 +1,4 @@
+requests==2.31.0
+gpiozero==2.0.1
+adafruit-circuitpython-dht==3.7.3
+picamera2==0.3.18

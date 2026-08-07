@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Baby Cradle Monitoring System - History</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #f0f6ff;
+            --bg-secondary: #ffffff;
+            --bg-card: rgba(255, 255, 255, 0.7);
+            --card-border: rgba(0, 20, 60, 0.06);
+            --text-primary: #0a1a3a;
+            --text-secondary: #1a3a6a;
+            --text-muted: #5a7a9a;
+            --accent-1: #2563eb;
+            --accent-2: #3b82f6;
+            --accent-3: #60a5fa;
+            --gradient-main: linear-gradient(135deg, #2563eb, #3b82f6, #60a5fa);
+            --gradient-glow: linear-gradient(135deg, rgba(37, 99, 235, 0.10), rgba(96, 165, 250, 0.06));
+            --danger: #ef4444;
+            --danger-bg: rgba(239, 68, 68, 0.08);
+            --warn: #f59e0b;
+            --warn-bg: rgba(245, 158, 11, 0.08);
+            --success: #22c55e;
+            --success-bg: rgba(34, 197, 94, 0.08);
+            --border-radius: 16px;
+            --border-radius-sm: 10px;
+            --shadow-card: 0 4px 20px rgba(37, 99, 235, 0.06);
+            --shadow-hover: 0 8px 40px rgba(37, 99, 235, 0.10);
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            --sidebar-width: 230px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                radial-gradient(circle at 15% 50%, rgba(37, 99, 235, 0.04) 0%, transparent 50%),
+                radial-gradient(circle at 85% 20%, rgba(59, 130, 246, 0.04) 0%, transparent 50%),
+                radial-gradient(circle at 50% 80%, rgba(96, 165, 250, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* ===== SIDEBAR ===== */
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: var(--sidebar-width);
+            height: 100vh;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--card-border);
+            padding: 20px 14px;
+            display: flex;
+            flex-direction: column;
+            z-index: 100;
+            box-shadow: 2px 0 24px rgba(37, 99, 235, 0.04);
+            transition: var(--transition);
+            overflow-y: auto;
+        }
+
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding-bottom: 18px;
+            border-bottom: 1px solid var(--card-border);
+            margin-bottom: 18px;
+        }
+
+        .sidebar-brand .logo {
+            width: 40px;
+            height: 40px;
+            border-radius: var(--border-radius-sm);
+            display: grid;
+            place-items: center;
+            background: var(--gradient-main);
+            font-size: 1.2rem;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.25);
+            flex-shrink: 0;
+            transition: var(--transition);
+        }
+
+        .sidebar-brand .logo:hover {
+            transform: scale(1.05) rotate(-5deg);
+            box-shadow: 0 6px 20px rgba(37, 99, 235, 0.35);
+        }
+
+        .sidebar-brand .brand-text h2 {
+            font-size: 0.95rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+            line-height: 1.2;
+        }
+
+        .sidebar-brand .brand-text small {
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.55rem;
+            font-weight: 500;
+            letter-spacing: 0.3px;
+        }
+
+        .sidebar-nav {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            flex: 1;
+        }
+
+        .sidebar-nav a.link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 9px 12px;
+            border-radius: var(--border-radius-sm);
+            font-weight: 600;
+            font-size: 0.8rem;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            position: relative;
+        }
+
+        .sidebar-nav a.link i {
+            width: 18px;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            transition: var(--transition);
+        }
+
+        .sidebar-nav a.link:hover {
+            color: var(--text-primary);
+            background: rgba(37, 99, 235, 0.06);
+        }
+
+        .sidebar-nav a.link:hover i {
+            color: var(--accent-1);
+        }
+
+        .sidebar-nav a.link.active {
+            background: var(--gradient-main);
+            color: #fff;
+            box-shadow: 0 4px 16px rgba(37, 99, 235, 0.25);
+        }
+
+        .sidebar-nav a.link.active::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 3px;
+            height: 24px;
+            background: #fff;
+            border-radius: 0 3px 3px 0;
+        }
+
+        .sidebar-nav a.link.active i {
+            color: #fff;
+        }
+
+        .sidebar-footer {
+            border-top: 1px solid var(--card-border);
+            padding-top: 14px;
+            margin-top: auto;
+        }
+
+        .sidebar-footer .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.65rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            padding: 4px 0;
+        }
+
+        .sidebar-footer .status-indicator .dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse-dot 2s infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .sidebar-footer .version {
+            font-size: 0.55rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* ===== MAIN CONTENT ===== */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            flex: 1;
+            padding: 20px 24px 26px;
+            min-height: 100vh;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* ===== TOP BAR ===== */
+        .top-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .top-bar .page-title h1 {
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: var(--text-primary);
+        }
+
+        .top-bar .page-title p {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 1px;
+        }
+
+        /* ===== STATS GRID ===== */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 14px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--card-border);
+            border-radius: var(--border-radius-sm);
+            padding: 16px 18px;
+            text-align: center;
+            transition: var(--transition);
+            box-shadow: var(--shadow-card);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            inset: 0 0 auto 0;
+            height: 3px;
+            background: var(--gradient-main);
+            opacity: 0.5;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-3px);
+            box-shadow: var(--shadow-hover);
+            border-color: rgba(37, 99, 235, 0.10);
+        }
+
+        .stat-card:hover .stat-value {
+            transform: scale(1.02);
+            transition: transform 0.2s ease;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 800;
+            background: var(--gradient-main);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            transition: transform 0.2s ease;
+        }
+
+        .stat-label {
+            color: var(--text-muted);
+            margin-top: 4px;
+            font-size: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            font-weight: 700;
+        }
+
+        /* ===== PANELS ===== */
+        .panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--card-border);
+            border-radius: var(--border-radius);
+            padding: 18px 20px;
+            margin-bottom: 20px;
+            box-shadow: var(--shadow-card);
+            transition: var(--transition);
+        }
+
+        .panel:hover {
+            box-shadow: var(--shadow-hover);
+        }
+
+        .panel-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 14px;
+        }
+
+        .panel-header .bar {
+            width: 4px;
+            height: 18px;
+            border-radius: 4px;
+            background: var(--gradient-main);
+            flex-shrink: 0;
+        }
+
+        .panel-header h2 {
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .panel-header .sub {
+            margin-left: auto;
+            font-size: 0.65rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        /* ===== CHART ===== */
+        .chart-wrapper {
+            height: 300px;
+            position: relative;
+        }
+
+        .chart-wrapper .chart-loading {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255, 255, 255, 0.7);
+            border-radius: var(--border-radius-sm);
+            z-index: 10;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        .chart-wrapper .chart-loading.active {
+            opacity: 1;
+        }
+
+        .chart-wrapper .chart-loading .spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid var(--card-border);
+            border-top-color: var(--accent-1);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* ===== FILTERS ===== */
+        .filters {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+            background: var(--bg-secondary);
+            padding: 14px 18px;
+            border-radius: var(--border-radius-sm);
+            border: 1px solid var(--card-border);
+            box-shadow: var(--shadow-card);
+        }
+
+        .filters .label {
+            font-weight: 600;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .filters .quick-stats {
+            display: flex;
+            gap: 16px;
+            margin-left: auto;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        .filters .quick-stats span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .filters .quick-stats .num {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        select {
+            padding: 8px 14px;
+            border-radius: var(--border-radius-sm);
+            border: 1px solid var(--card-border);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-size: 0.8rem;
+            font-weight: 500;
+            cursor: pointer;
+            font-family: inherit;
+            outline: none;
+            transition: var(--transition);
+            min-width: 150px;
+        }
+
+        select:hover {
+            border-color: var(--accent-1);
+        }
+
+        select:focus {
+            border-color: var(--accent-1);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);
+        }
+
+        .btn {
+            background: var(--gradient-main);
+            color: #fff;
+            border: none;
+            padding: 8px 20px;
+            border-radius: var(--border-radius-sm);
+            cursor: pointer;
+            font-weight: 700;
+            font-size: 0.78rem;
+            font-family: inherit;
+            transition: var(--transition);
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.2);
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 24px rgba(37, 99, 235, 0.3);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-export {
+            background: var(--bg-primary);
+            color: var(--text-secondary);
+            border: 1px solid var(--card-border);
+            box-shadow: none;
+        }
+
+        .btn-export:hover {
+            background: var(--bg-secondary);
+            box-shadow: var(--shadow-card);
+            transform: translateY(-2px);
+        }
+
+        /* ===== TABLE ===== */
+        .table-wrap {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8rem;
+        }
+
+        th {
+            padding: 12px 14px;
+            text-align: left;
+            color: var(--text-muted);
+            font-weight: 700;
+            font-size: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            border-bottom: 2px solid var(--card-border);
+            position: sticky;
+            top: 0;
+            background: var(--bg-secondary);
+        }
+
+        td {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--card-border);
+            color: var(--text-secondary);
+            transition: background 0.2s ease;
+        }
+
+        tr:hover td {
+            background: rgba(37, 99, 235, 0.03);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .tag {
+            padding: 3px 12px;
+            border-radius: 30px;
+            font-size: 0.6rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            display: inline-block;
+            transition: all 0.2s ease;
+        }
+
+        .tag:hover {
+            transform: scale(1.05);
+        }
+
+        .tag-on {
+            background: var(--warn-bg);
+            color: var(--warn);
+        }
+
+        .tag-off {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+
+        .tag-wet {
+            background: var(--danger-bg);
+            color: var(--danger);
+        }
+
+        .tag-dry {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+
+        /* ===== PAGINATION ===== */
+        .pagination {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 14px;
+            padding-top: 14px;
+            border-top: 1px solid var(--card-border);
+        }
+
+        .pagination .info {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        .pagination .controls {
+            display: flex;
+            gap: 6px;
+        }
+
+        .pagination .controls button {
+            padding: 6px 14px;
+            border: 1px solid var(--card-border);
+            border-radius: var(--border-radius-sm);
+            background: var(--bg-primary);
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 0.7rem;
+            font-weight: 600;
+            transition: var(--transition);
+            font-family: inherit;
+        }
+
+        .pagination .controls button:hover:not(:disabled) {
+            background: var(--gradient-main);
+            color: #fff;
+            border-color: var(--accent-1);
+            transform: translateY(-1px);
+        }
+
+        .pagination .controls button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .pagination .controls button.active {
+            background: var(--gradient-main);
+            color: #fff;
+            border-color: var(--accent-1);
+        }
+
+        /* ===== FOOTER ===== */
+        .footer {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.65rem;
+            padding: 16px 0 4px;
+            border-top: 1px solid var(--card-border);
+            margin-top: 6px;
+            letter-spacing: 0.3px;
+        }
+
+        .footer span {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        /* ===== RESPONSIVE ===== */
+        @media (max-width: 992px) {
+            :root {
+                --sidebar-width: 0px;
+            }
+
+            .sidebar {
+                transform: translateX(-100%);
+                width: 270px;
+                box-shadow: 4px 0 40px rgba(0, 0, 0, 0.08);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .main-content {
+                margin-left: 0;
+                padding: 14px 16px 20px;
+            }
+
+            .hamburger {
+                display: flex !important;
+            }
+
+            .stats-grid {
+                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                gap: 10px;
+            }
+
+            .stat-value {
+                font-size: 1.6rem;
+            }
+
+            .filters .quick-stats {
+                margin-left: 0;
+                width: 100%;
+                justify-content: flex-start;
+                gap: 12px;
+            }
+        }
+
+        .hamburger {
+            display: none;
+            background: none;
+            border: none;
+            font-size: 1.3rem;
+            color: var(--text-primary);
+            cursor: pointer;
+            padding: 5px;
+            border-radius: 8px;
+            transition: var(--transition);
+        }
+
+        .hamburger:hover {
+            background: rgba(37, 99, 235, 0.06);
+        }
+
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.25);
+            z-index: 99;
+            backdrop-filter: blur(4px);
+        }
+
+        .sidebar-overlay.active {
+            display: block;
+        }
+
+        @media (max-width: 480px) {
+            .top-bar .page-title h1 {
+                font-size: 1rem;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr 1fr;
+                gap: 8px;
+            }
+
+            .stat-card {
+                padding: 12px 12px;
+            }
+
+            .stat-value {
+                font-size: 1.3rem;
+            }
+
+            .panel {
+                padding: 14px 12px;
+            }
+
+            .chart-wrapper {
+                height: 200px;
+            }
+
+            .filters {
+                padding: 10px 12px;
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .filters .label {
+                margin-bottom: 4px;
+            }
+
+            select {
+                width: 100%;
+            }
+
+            .btn {
+                width: 100%;
+                text-align: center;
+            }
+
+            table {
+                font-size: 0.7rem;
+            }
+
+            th, td {
+                padding: 8px 10px;
+            }
+
+            .pagination {
+                flex-direction: column;
+                align-items: stretch;
+                text-align: center;
+            }
+
+            .pagination .controls {
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ===== SIDEBAR ===== -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-brand">
+            <div class="logo">🚼</div>
+            <div class="brand-text">
+                <h2>Baby Cradle</h2>
+                <small>Smart Monitoring</small>
+            </div>
+        </div>
+
+        <nav class="sidebar-nav">
+            <a href="/" class="link">
+                <i>📊</i> Dashboard
+            </a>
+            <a href="/live" class="link">
+                <i>📷</i> Live Video
+            </a>
+            <a href="/history" class="link active">
+                <i>📈</i> History
+            </a>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="status-indicator">
+                <span class="dot"></span>
+                <span id="conn-status">Online</span>
+            </div>
+            <div class="version">v2.1.4</div>
+        </div>
+    </aside>
+
+    <!-- ===== OVERLAY FOR MOBILE ===== -->
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <main class="main-content">
+
+        <!-- Top Bar -->
+        <div class="top-bar">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <button class="hamburger" id="hamburgerBtn" aria-label="Toggle sidebar">
+                    ☰
+                </button>
+                <div class="page-title">
+                    <h1>History</h1>
+                    <p>Historical sensor data & trends</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== STATS ===== -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" id="avg-temp">--</div>
+                <div class="stat-label">Avg Temperature (°C)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="avg-hum">--</div>
+                <div class="stat-label">Avg Humidity (%)</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="max-temp">--</div>
+                <div class="stat-label">Max Temperature</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="min-temp">--</div>
+                <div class="stat-label">Min Temperature</div>
+            </div>
+        </div>
+
+        <!-- ===== CHART ===== -->
+        <div class="panel">
+            <div class="panel-header">
+                <span class="bar"></span>
+                <h2>Historical Trends</h2>
+                <span class="sub" id="chartSub">Last 24 hours</span>
+            </div>
+            <div class="chart-wrapper">
+                <div class="chart-loading" id="chartLoading">
+                    <div class="spinner"></div>
+                </div>
+                <canvas id="historyChart"></canvas>
+            </div>
+        </div>
+
+        <!-- ===== FILTERS ===== -->
+        <div class="filters">
+            <span class="label">📊 Time Range:</span>
+            <select id="rangeSelect">
+                <option value="24">Last 24 Hours</option>
+                <option value="48">Last 48 Hours</option>
+                <option value="168">Last 7 Days</option>
+                <option value="720">Last 30 Days</option>
+            </select>
+            <button class="btn" onclick="loadData()">🔄 Refresh</button>
+            <button class="btn btn-export" onclick="exportData()">📥 Export CSV</button>
+            <div class="quick-stats">
+                <span>📊 <span class="num" id="total-readings">0</span> readings</span>
+                <span>📅 <span class="num" id="date-range">--</span></span>
+            </div>
+        </div>
+
+        <!-- ===== TABLE ===== -->
+        <div class="panel">
+            <div class="panel-header">
+                <span class="bar"></span>
+                <h2>Recent Readings</h2>
+                <span class="sub">Live updates</span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Temperature</th>
+                            <th>Humidity</th>
+                            <th>Motion</th>
+                            <th>Sound</th>
+                            <th>Diaper</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody"></tbody>
+                </table>
+            </div>
+            <!-- ===== PAGINATION ===== -->
+            <div class="pagination">
+                <div class="info">Showing <span id="showing-start">0</span>-<span id="showing-end">0</span> of <span id="total-items">0</span></div>
+                <div class="controls" id="paginationControls">
+                    <button id="prevPage" disabled onclick="changePage(-1)">← Prev</button>
+                    <button id="page1" class="active" onclick="goToPage(1)">1</button>
+                    <button id="nextPage" onclick="changePage(1)">Next →</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== FOOTER ===== -->
+        <div class="footer">
+            <span>Baby Cradle Monitoring System</span> &middot; v2.1.4
+        </div>
+
+    </main>
+
+    <script>
+        let chart;
+        let allData = [];
+        let currentPage = 1;
+        const pageSize = 10;
+
+        // ===== SIDEBAR TOGGLE =====
+        const hamburger = document.getElementById('hamburgerBtn');
+        const sidebar = document.getElementById('sidebar');
+        const overlay = document.getElementById('sidebarOverlay');
+
+        function toggleSidebar() {
+            sidebar.classList.toggle('open');
+            overlay.classList.toggle('active');
+            document.body.style.overflow = sidebar.classList.contains('open') ? 'hidden' : '';
+        }
+
+        hamburger.addEventListener('click', toggleSidebar);
+        overlay.addEventListener('click', toggleSidebar);
+
+        document.querySelectorAll('.sidebar-nav a').forEach(link => {
+            link.addEventListener('click', () => {
+                if (window.innerWidth <= 992) {
+                    sidebar.classList.remove('open');
+                    overlay.classList.remove('active');
+                    document.body.style.overflow = '';
+                }
+            });
+        });
+
+        // ===== EXPORT DATA =====
+        function exportData() {
+            if (!allData || allData.length === 0) {
+                alert('No data to export');
+                return;
+            }
+
+            // Create CSV
+            const headers = ['Time', 'Temperature (°C)', 'Humidity (%)', 'Motion', 'Sound', 'Diaper'];
+            const rows = allData.map(d => [
+                new Date(d.created_at).toLocaleString(),
+                d.temperature ?? '',
+                d.humidity ?? '',
+                d.motion_detected ? 'Active' : 'Quiet',
+                d.sound_level ? 'Loud' : 'Quiet',
+                d.wetness_detected ? 'Wet' : 'Dry'
+            ]);
+
+            const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `baby_cradle_history_${new Date().toISOString().slice(0,10)}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        // ===== PAGINATION =====
+        function renderTablePage(page) {
+            const start = (page - 1) * pageSize;
+            const end = Math.min(start + pageSize, allData.length);
+            const pageData = allData.slice(start, end);
+
+            document.getElementById('showing-start').textContent = allData.length > 0 ? start + 1 : 0;
+            document.getElementById('showing-end').textContent = end;
+            document.getElementById('total-items').textContent = allData.length;
+
+            // Update buttons
+            document.getElementById('prevPage').disabled = page <= 1;
+            document.getElementById('nextPage').disabled = page >= Math.ceil(allData.length / pageSize);
+
+            // Update page buttons
+            const totalPages = Math.ceil(allData.length / pageSize);
+            const controls = document.getElementById('paginationControls');
+            // Keep prev, next and update page buttons
+            const existingButtons = controls.querySelectorAll('button:not(#prevPage):not(#nextPage)');
+            existingButtons.forEach(btn => btn.remove());
+
+            // Show page buttons (max 5)
+            let startPage = Math.max(1, page - 2);
+            let endPage = Math.min(totalPages, page + 2);
+            if (endPage - startPage < 4) {
+                if (startPage === 1) endPage = Math.min(totalPages, 5);
+                else if (endPage === totalPages) startPage = Math.max(1, totalPages - 4);
+            }
+
+            for (let i = startPage; i <= endPage; i++) {
+                const btn = document.createElement('button');
+                btn.textContent = i;
+                btn.className = i === page ? 'active' : '';
+                btn.onclick = () => goToPage(i);
+                controls.insertBefore(btn, document.getElementById('nextPage'));
+            }
+
+            // Render table rows
+            document.getElementById('tableBody').innerHTML = pageData.map(r => `
+                <tr>
+                    <td>${new Date(r.created_at).toLocaleString()}</td>
+                    <td>${r.temperature != null ? r.temperature + '°C' : '--'}</td>
+                    <td>${r.humidity != null ? r.humidity + '%' : '--'}</td>
+                    <td><span class="tag ${r.motion_detected ? 'tag-on' : 'tag-off'}">${r.motion_detected ? 'Active' : 'Quiet'}</span></td>
+                    <td><span class="tag ${r.sound_level ? 'tag-on' : 'tag-off'}">${r.sound_level ? 'Loud' : 'Quiet'}</span></td>
+                    <td><span class="tag ${r.wetness_detected ? 'tag-wet' : 'tag-dry'}">${r.wetness_detected ? 'Wet' : 'Dry'}</span></td>
+                </tr>
+            `).join('');
+        }
+
+        function changePage(delta) {
+            const totalPages = Math.ceil(allData.length / pageSize);
+            const newPage = Math.max(1, Math.min(totalPages, currentPage + delta));
+            if (newPage !== currentPage) {
+                currentPage = newPage;
+                renderTablePage(currentPage);
+            }
+        }
+
+        function goToPage(page) {
+            const totalPages = Math.ceil(allData.length / pageSize);
+            if (page >= 1 && page <= totalPages && page !== currentPage) {
+                currentPage = page;
+                renderTablePage(currentPage);
+            }
+        }
+
+        // ===== LOAD DATA =====
+        async function loadData() {
+            const hours = document.getElementById('rangeSelect').value;
+            const loading = document.getElementById('chartLoading');
+            loading.classList.add('active');
+
+            try {
+                const response = await fetch(`/api/history?limit=${hours * 12}`);
+                const data = await response.json();
+
+                if (data && data.length > 0) {
+                    allData = data;
+                    const temps = data.map(d => d.temperature).filter(t => t != null);
+                    const hums = data.map(d => d.humidity).filter(h => h != null);
+
+                    if (temps.length) {
+                        document.getElementById('avg-temp').textContent = (temps.reduce((a, b) => a + b, 0) / temps.length).toFixed(1);
+                        document.getElementById('max-temp').textContent = Math.max(...temps).toFixed(1);
+                        document.getElementById('min-temp').textContent = Math.min(...temps).toFixed(1);
+                    }
+                    if (hums.length) {
+                        document.getElementById('avg-hum').textContent = Math.round(hums.reduce((a, b) => a + b, 0) / hums.length);
+                    }
+
+                    // Update quick stats
+                    document.getElementById('total-readings').textContent = data.length;
+                    if (data.length > 0) {
+                        const firstDate = new Date(data[data.length - 1].created_at);
+                        const lastDate = new Date(data[0].created_at);
+                        document.getElementById('date-range').textContent =
+                            `${firstDate.toLocaleDateString()} - ${lastDate.toLocaleDateString()}`;
+                    }
+
+                    const recent = data.slice(-100).reverse();
+                    const labels = recent.map(d => new Date(d.created_at).toLocaleString());
+                    const tempData = recent.map(d => d.temperature);
+                    const humData = recent.map(d => d.humidity);
+
+                    // Update chart subtitle
+                    const sub = document.getElementById('chartSub');
+                    if (sub) {
+                        const hoursText = hours === '24' ? '24 hours' :
+                                         hours === '48' ? '48 hours' :
+                                         hours === '168' ? '7 days' : '30 days';
+                        sub.textContent = `Last ${hoursText}`;
+                    }
+
+                    if (chart) chart.destroy();
+                    const ctx = document.getElementById('historyChart').getContext('2d');
+                    chart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels,
+                            datasets: [
+                                {
+                                    label: 'Temperature (°C)',
+                                    data: tempData,
+                                    borderColor: '#2563eb',
+                                    backgroundColor: 'rgba(37, 99, 235, 0.06)',
+                                    tension: 0.3,
+                                    yAxisID: 'y',
+                                    pointRadius: 0,
+                                    borderWidth: 2.5,
+                                    fill: true
+                                },
+                                {
+                                    label: 'Humidity (%)',
+                                    data: humData,
+                                    borderColor: '#60a5fa',
+                                    backgroundColor: 'rgba(96, 165, 250, 0.06)',
+                                    tension: 0.3,
+                                    yAxisID: 'y1',
+                                    pointRadius: 0,
+                                    borderWidth: 2.5,
+                                    fill: true
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            interaction: {
+                                mode: 'index',
+                                intersect: false
+                            },
+                            plugins: {
+                                legend: {
+                                    labels: {
+                                        color: '#5a7a9a',
+                                        font: {
+                                            family: 'Inter',
+                                            weight: '600',
+                                            size: 10
+                                        },
+                                        padding: 16,
+                                        usePointStyle: true,
+                                        pointStyle: 'circle'
+                                    }
+                                },
+                                tooltip: {
+                                    callbacks: {
+                                        label: function(context) {
+                                            let label = context.dataset.label || '';
+                                            let value = context.parsed.y;
+                                            if (value != null) {
+                                                label += ': ' + value.toFixed(1);
+                                                if (context.dataset.label.includes('Temperature')) {
+                                                    label += '°C';
+                                                } else {
+                                                    label += '%';
+                                                }
+                                            }
+                                            return label;
+                                        }
+                                    }
+                                }
+                            },
+                            scales: {
+                                x: {
+                                    ticks: {
+                                        color: '#5a7a9a',
+                                        font: { family: 'Inter', size: 8 },
+                                        maxTicksLimit: 12
+                                    },
+                                    grid: {
+                                        color: 'rgba(37, 99, 235, 0.04)'
+                                    }
+                                },
+                                y: {
+                                    type: 'linear',
+                                    position: 'left',
+                                    title: {
+                                        display: true,
+                                        text: '°C',
+                                        color: '#5a7a9a',
+                                        font: { family: 'Inter', weight: '600', size: 9 }
+                                    },
+                                    min: 0,
+                                    max: 40,
+                                    ticks: {
+                                        color: '#5a7a9a',
+                                        font: { family: 'Inter', size: 8 }
+                                    },
+                                    grid: {
+                                        color: 'rgba(37, 99, 235, 0.04)'
+                                    }
+                                },
+                                y1: {
+                                    type: 'linear',
+                                    position: 'right',
+                                    title: {
+                                        display: true,
+                                        text: '%',
+                                        color: '#5a7a9a',
+                                        font: { family: 'Inter', weight: '600', size: 9 }
+                                    },
+                                    min: 0,
+                                    max: 100,
+                                    grid: {
+                                        drawOnChartArea: false
+                                    },
+                                    ticks: {
+                                        color: '#5a7a9a',
+                                        font: { family: 'Inter', size: 8 }
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    // Reset to first page and render table
+                    currentPage = 1;
+                    renderTablePage(currentPage);
+                }
+            } catch (e) {
+                console.error('Error loading history data:', e);
+            } finally {
+                loading.classList.remove('active');
+            }
+        }
+
+        // Initial load and auto-refresh every 60 seconds
+        loadData();
+        setInterval(loadData, 60000);
+    </script>
+</body>
+</html>
