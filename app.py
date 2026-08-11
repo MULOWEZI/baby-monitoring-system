@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 
+# ============================================================
+# GEVENT MONKEY-PATCHING
+#
+# This MUST happen before any other imports (including
+# stdlib ones like os, sys, threading, queue) so that
+# gevent can green the standard library's sockets,
+# threading, and queue primitives before anything else
+# grabs a reference to the original blocking versions.
+# ============================================================
+
+from gevent import monkey
+monkey.patch_all()
+
 import os
 import sys
 import time
@@ -48,7 +61,8 @@ app.config["SECRET_KEY"] = os.getenv(
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*"
+    cors_allowed_origins="*",
+    async_mode="gevent"
 )
 
 
