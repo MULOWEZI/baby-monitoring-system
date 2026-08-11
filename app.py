@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 
-# ============================================================
-# GEVENT MONKEY-PATCHING
-#
-# This MUST happen before any other imports (including
-# stdlib ones like os, sys, threading, queue) so that
-# gevent can green the standard library's sockets,
-# threading, and queue primitives before anything else
-# grabs a reference to the original blocking versions.
-# ============================================================
-
-from gevent import monkey
-monkey.patch_all()
-
 import os
 import sys
 import time
@@ -29,6 +16,13 @@ from dotenv import load_dotenv
 
 
 # ============================================================
+# ENVIRONMENT
+# ============================================================
+
+load_dotenv()
+
+
+# ============================================================
 # LOGGING
 # ============================================================
 
@@ -42,13 +36,6 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
-# ============================================================
-
-load_dotenv()
-
-
-# ============================================================
 # FLASK
 # ============================================================
 
@@ -59,10 +46,20 @@ app.config["SECRET_KEY"] = os.getenv(
     "baby-monitor-secret-key"
 )
 
+
+# ============================================================
+# SOCKET.IO
+# ============================================================
+
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="gevent"
+    async_mode="threading",
+    logger=False,
+    engineio_logger=False,
+    ping_interval=25,
+    ping_timeout=60,
+    max_http_buffer_size=1_000_000
 )
 
 
@@ -86,14 +83,11 @@ if SUPABASE_URL and SUPABASE_KEY:
             SUPABASE_KEY
         )
 
-        log.info(
-            "Supabase client connected: %s",
-            SUPABASE_URL[:30] + "..."
-        )
+        log.info("Supabase connected")
 
     except Exception as e:
 
-        log.warning(
+        log.exception(
             "Supabase initialization failed: %s",
             e
         )
@@ -101,7 +95,7 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
 
     log.warning(
-        "SUPABASE_URL/KEY not set — running without database"
+        "SUPABASE_URL or SUPABASE_KEY missing"
     )
 
 
@@ -110,65 +104,90 @@ else:
 # ============================================================
 
 current_data = {
-
     "temperature": 0,
-
     "humidity": 0,
-
     "motion": False,
-
     "sound": 0,
-
     "wetness": False,
-
     "last_update": None
 }
 
+current_data_lock = threading.Lock()
+
 
 # ============================================================
-# VIDEO STREAMING
+# VIDEO
 # ============================================================
 
 latest_frame = None
 
-_frame_lock = threading.Lock()
+frame_lock = threading.Lock()
 
-_frame_subscribers = []
+frame_subscribers = []
 
-_subscribers_lock = threading.Lock()
+subscribers_lock = threading.Lock()
 
 
-def _broadcast_frame(frame):
+def broadcast_frame(frame):
+    """
+    Broadcast only the newest frame.
 
-    with _subscribers_lock:
+    Every client has a queue of size 1.
+    Therefore old frames are discarded.
+    """
 
-        for q in _frame_subscribers:
+    with subscribers_lock:
+        subscribers = list(frame_subscribers)
+
+    for q in subscribers:
+
+        try:
+
+            q.put_nowait(frame)
+
+        except queue.Full:
+
+            # Throw away old frame.
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
 
             try:
-
                 q.put_nowait(frame)
-
             except queue.Full:
-
-                try:
-
-                    q.get_nowait()
-
-                except queue.Empty:
-
-                    pass
-
-                try:
-
-                    q.put_nowait(frame)
-
-                except queue.Full:
-
-                    pass
+                pass
 
 
 # ============================================================
-# EMAIL CONFIGURATION
+# SENSOR QUEUE
+# ============================================================
+
+SENSOR_QUEUE_SIZE = int(
+    os.getenv(
+        "SENSOR_QUEUE_SIZE",
+        "30"
+    )
+)
+
+sensor_queue = queue.Queue(
+    maxsize=SENSOR_QUEUE_SIZE
+)
+
+
+# ============================================================
+# EMAIL QUEUE
+# ============================================================
+
+EMAIL_QUEUE_SIZE = 10
+
+email_queue = queue.Queue(
+    maxsize=EMAIL_QUEUE_SIZE
+)
+
+
+# ============================================================
+# BIRD EMAIL
 # ============================================================
 
 BIRD_API_KEY = os.getenv(
@@ -187,20 +206,12 @@ ALERT_EMAIL = os.getenv(
 )
 
 
+# Reuse HTTP connection.
+bird_session = requests.Session()
+
+
 # ============================================================
 # ALERT STATE
-#
-# These variables prevent repeated alerts while the SAME
-# condition remains active.
-#
-# Example:
-#
-# dry -> wet       = alert
-# wet -> wet       = nothing
-# wet -> dry       = reset
-# dry -> wet       = alert again
-#
-# Same principle for temperature.
 # ============================================================
 
 alert_state_lock = threading.Lock()
@@ -211,18 +222,52 @@ previous_temperature_abnormal = False
 
 
 # ============================================================
+# SIMPLE CACHE
+# ============================================================
+
+history_cache = None
+history_cache_time = 0
+
+alerts_cache = None
+alerts_cache_time = 0
+
+cache_lock = threading.Lock()
+
+CACHE_SECONDS = float(
+    os.getenv(
+        "CACHE_SECONDS",
+        "2"
+    )
+)
+
+
+def invalidate_history_cache():
+
+    global history_cache
+    global history_cache_time
+
+    with cache_lock:
+
+        history_cache = None
+        history_cache_time = 0
+
+
+def invalidate_alert_cache():
+
+    global alerts_cache
+    global alerts_cache_time
+
+    with cache_lock:
+
+        alerts_cache = None
+        alerts_cache_time = 0
+
+
+# ============================================================
 # BIRD HOST
 # ============================================================
 
 def bird_host():
-
-    """
-    Derive Bird platform host from the API key region.
-
-    Example:
-        bk_us1_xxxxx
-        -> https://us1.platform.bird.com
-    """
 
     parts = BIRD_API_KEY.split("_")
 
@@ -236,50 +281,26 @@ def bird_host():
 
 
 # ============================================================
-# SEND EMAIL
+# EMAIL
 # ============================================================
 
 def send_alert_email(alerts):
 
-    """
-    Sends one email containing the supplied alerts.
-
-    This function is only called when a NEW alert event
-    occurs.
-    """
-
     if not alerts:
-
         return False
-
 
     if not BIRD_API_KEY:
-
-        log.warning(
-            "BIRD_API_KEY not set — skipping email notification"
-        )
-
+        log.warning("BIRD_API_KEY not configured")
         return False
-
 
     if not ALERT_EMAIL:
-
-        log.warning(
-            "ALERT_EMAIL not set — skipping email notification"
-        )
-
+        log.warning("ALERT_EMAIL not configured")
         return False
-
-
-    # --------------------------------------------------------
-    # Determine email subject
-    # --------------------------------------------------------
 
     alert_types = {
         alert.get("alert_type")
         for alert in alerts
     }
-
 
     if "wetness" in alert_types:
 
@@ -294,18 +315,15 @@ def send_alert_email(alerts):
         subject = "🚼 Baby Monitoring Alert"
 
 
-    # --------------------------------------------------------
-    # Create HTML alert list
-    # --------------------------------------------------------
-
     items = ""
 
     for alert in alerts:
 
         items += (
             "<li>"
-            f"<strong>{alert.get('severity', 'warning').upper()}</strong>"
-            " — "
+            f"<strong>"
+            f"{alert.get('severity', 'warning').upper()}"
+            f"</strong> — "
             f"{alert.get('message', '')}"
             "</li>"
         )
@@ -316,9 +334,14 @@ def send_alert_email(alerts):
     )
 
 
+    dashboard_url = os.getenv(
+        "DASHBOARD_URL",
+        "https://baby-monitoring-system-7.onrender.com"
+    )
+
+
     html = f"""
     <html>
-
     <body>
 
         <h2>🚼 Baby Cradle Monitoring Alert</h2>
@@ -329,7 +352,8 @@ def send_alert_email(alerts):
         </p>
 
         <p>
-            <strong>Time:</strong> {timestamp}
+            <strong>Time:</strong>
+            {timestamp}
         </p>
 
         <ul>
@@ -341,39 +365,30 @@ def send_alert_email(alerts):
         </p>
 
         <p>
-            <a href="https://baby-monitoring-system.onrender.com">
+            <a href="{dashboard_url}">
                 Open Baby Monitoring Dashboard
             </a>
         </p>
 
     </body>
-
     </html>
     """
 
 
     payload = {
-
         "from": BIRD_SENDER,
-
-        "to": [
-            ALERT_EMAIL
-        ],
-
+        "to": [ALERT_EMAIL],
         "subject": subject,
-
         "html": html
     }
 
 
     try:
 
-        response = requests.post(
-
+        response = bird_session.post(
             f"{bird_host()}/v1/email/messages",
 
             headers={
-
                 "Authorization":
                     f"Bearer {BIRD_API_KEY}",
 
@@ -383,15 +398,14 @@ def send_alert_email(alerts):
 
             json=payload,
 
-            timeout=15
+            timeout=10
         )
 
 
         if response.status_code in (200, 202):
 
             log.info(
-                "Alert email sent to %s (%s)",
-                ALERT_EMAIL,
+                "Alert email sent (%s)",
                 response.status_code
             )
 
@@ -399,9 +413,9 @@ def send_alert_email(alerts):
 
 
         log.error(
-            "Bird email failed %s: %s",
+            "Bird email failed: %s %s",
             response.status_code,
-            response.text[:300]
+            response.text[:200]
         )
 
 
@@ -417,47 +431,86 @@ def send_alert_email(alerts):
 
 
 # ============================================================
-# TEMPERATURE / HUMIDITY CHECK
+# EMAIL WORKER
+# ============================================================
+
+def email_worker():
+
+    log.info("Email worker started")
+
+    while True:
+
+        try:
+
+            alerts = email_queue.get()
+
+            try:
+                send_alert_email(alerts)
+
+            except Exception:
+
+                log.exception(
+                    "Email worker error"
+                )
+
+            finally:
+
+                email_queue.task_done()
+
+        except Exception:
+
+            log.exception(
+                "Email queue error"
+            )
+
+
+# Only ONE email worker.
+email_thread = threading.Thread(
+    target=email_worker,
+    daemon=True
+)
+
+email_thread.start()
+
+
+# ============================================================
+# ABNORMAL SENSOR CHECK
 # ============================================================
 
 def check_abnormal(temp, hum):
 
-    temp_min = float(
-        os.getenv("TEMP_MIN", 20)
-    )
+    try:
 
-    temp_max = float(
-        os.getenv("TEMP_MAX", 25)
-    )
+        temp_min = float(
+            os.getenv("TEMP_MIN", "20")
+        )
 
-    hum_min = float(
-        os.getenv("HUMIDITY_MIN", 40)
-    )
+        temp_max = float(
+            os.getenv("TEMP_MAX", "25")
+        )
 
-    hum_max = float(
-        os.getenv("HUMIDITY_MAX", 60)
-    )
+        hum_min = float(
+            os.getenv("HUMIDITY_MIN", "40")
+        )
+
+        hum_max = float(
+            os.getenv("HUMIDITY_MAX", "60")
+        )
+
+    except ValueError:
+
+        return False
 
 
     if temp is not None:
 
-        if (
-            temp < temp_min
-            or
-            temp > temp_max
-        ):
-
+        if temp < temp_min or temp > temp_max:
             return True
 
 
     if hum is not None:
 
-        if (
-            hum < hum_min
-            or
-            hum > hum_max
-        ):
-
+        if hum < hum_min or hum > hum_max:
             return True
 
 
@@ -465,7 +518,7 @@ def check_abnormal(temp, hum):
 
 
 # ============================================================
-# EVENT-BASED ALERT LOGIC
+# ALERT DETECTION
 # ============================================================
 
 def check_alerts(
@@ -475,97 +528,48 @@ def check_alerts(
     sound
 ):
 
-    """
-    Detect NEW alert events.
-
-    WETNESS:
-
-        False -> True
-        = NEW EVENT
-
-        True -> True
-        = NO NEW EVENT
-
-        True -> False
-        = RESET
-
-    TEMPERATURE:
-
-        Normal -> Abnormal
-        = NEW EVENT
-
-        Abnormal -> Abnormal
-        = NO NEW EVENT
-
-        Abnormal -> Normal
-        = RESET
-    """
-
     global previous_wetness
     global previous_temperature_abnormal
 
 
-    # ========================================================
-    # THRESHOLDS
-    # ========================================================
+    try:
 
-    temp_min = float(
-        os.getenv("TEMP_MIN", 20)
-    )
+        temp_min = float(
+            os.getenv("TEMP_MIN", "20")
+        )
 
-    temp_max = float(
-        os.getenv("TEMP_MAX", 25)
-    )
+        temp_max = float(
+            os.getenv("TEMP_MAX", "25")
+        )
+
+    except ValueError:
+
+        temp_min = 20
+        temp_max = 25
 
 
     alerts = []
 
 
-    # ========================================================
-    # CURRENT TEMPERATURE STATE
-    # ========================================================
-
     temperature_abnormal = False
-
 
     if temp is not None:
 
         temperature_abnormal = (
-
             temp < temp_min
-
             or
-
             temp > temp_max
         )
 
 
-    # ========================================================
-    # WETNESS STATE
-    # ========================================================
+    current_wetness = bool(wetness)
 
-    current_wetness = bool(
-        wetness
-    )
-
-
-    # ========================================================
-    # LOCK STATE CHANGES
-    # ========================================================
 
     with alert_state_lock:
 
-
-        # ----------------------------------------------------
-        # TEMPERATURE
-        # ----------------------------------------------------
-
         new_temperature_event = (
-
             temperature_abnormal
-
             and
-
             not previous_temperature_abnormal
         )
 
@@ -576,55 +580,34 @@ def check_alerts(
 
                 message = (
                     f"🌡️ Temperature is too high: "
-                    f"{temp}°C. "
-                    f"Configured maximum is "
+                    f"{temp}°C. Configured maximum is "
                     f"{temp_max}°C."
-                )
-
-            elif temp < temp_min:
-
-                message = (
-                    f"🌡️ Temperature is too low: "
-                    f"{temp}°C. "
-                    f"Configured minimum is "
-                    f"{temp_min}°C."
                 )
 
             else:
 
                 message = (
-                    f"🌡️ Abnormal temperature detected: "
-                    f"{temp}°C."
+                    f"🌡️ Temperature is too low: "
+                    f"{temp}°C. Configured minimum is "
+                    f"{temp_min}°C."
                 )
 
 
             alerts.append({
-
                 "alert_type": "temperature",
-
                 "severity": "critical",
-
                 "message": message
             })
 
-
-        # Save current temperature state
 
         previous_temperature_abnormal = (
             temperature_abnormal
         )
 
 
-        # ----------------------------------------------------
-        # WET DIAPER
-        # ----------------------------------------------------
-
         new_wetness_event = (
-
             current_wetness
-
             and
-
             not previous_wetness
         )
 
@@ -632,35 +615,23 @@ def check_alerts(
         if new_wetness_event:
 
             alerts.append({
-
                 "alert_type": "wetness",
-
                 "severity": "critical",
-
                 "message":
                     "💧 Diaper is wet! "
                     "Please change the diaper."
             })
 
 
-        # Save current wetness state
+        previous_wetness = current_wetness
 
-        previous_wetness = (
-            current_wetness
-        )
-
-
-    # ========================================================
-    # NO NEW EVENTS
-    # ========================================================
 
     if not alerts:
-
         return
 
 
     # ========================================================
-    # SAVE ALERTS TO SUPABASE
+    # DATABASE
     # ========================================================
 
     if supabase is not None:
@@ -675,43 +646,68 @@ def check_alerts(
                     alert
                 ).execute()
 
-
-                # Immediately update dashboard
-
-                socketio.emit(
-                    "new_alert",
-                    alert
-                )
-
-
                 log.info(
                     "NEW ALERT: %s",
                     alert["message"]
                 )
 
+                invalidate_alert_cache()
 
             except Exception as e:
 
                 log.error(
-                    "Supabase alert insert error: %s",
+                    "Alert DB error: %s",
                     e
                 )
 
 
     # ========================================================
-    # SEND ONE EMAIL FOR THE NEW EVENT
+    # SOCKET
     # ========================================================
 
-    send_alert_email(
-        alerts
-    )
+    for alert in alerts:
+
+        try:
+
+            socketio.emit(
+                "new_alert",
+                alert
+            )
+
+        except Exception as e:
+
+            log.debug(
+                "Socket alert emit failed: %s",
+                e
+            )
+
+
+    # ========================================================
+    # EMAIL
+    #
+    # DO NOT SEND EMAIL HERE.
+    #
+    # Put it in a separate queue.
+    # ========================================================
+
+    try:
+
+        email_queue.put_nowait(
+            alerts
+        )
+
+    except queue.Full:
+
+        log.warning(
+            "Email queue full; skipping email"
+        )
 
 
 # ============================================================
-# PROCESS SENSOR READING
+# SENSOR PROCESSING
 # ============================================================
 
-def _process_reading_async(
+def process_sensor_reading(
     temp,
     hum,
     motion,
@@ -719,30 +715,18 @@ def _process_reading_async(
     wetness
 ):
 
-    """
-    Saves the sensor reading to Supabase and checks
-    for new alert events.
-    """
-
-
     # ========================================================
-    # SAVE SENSOR READING
+    # DATABASE
     # ========================================================
 
     if supabase is not None:
 
         reading = {
-
             "temperature": temp,
-
             "humidity": hum,
-
             "motion_detected": motion,
-
             "sound_level": sound,
-
             "wetness_detected": wetness,
-
             "is_abnormal":
                 check_abnormal(
                     temp,
@@ -759,38 +743,85 @@ def _process_reading_async(
                 reading
             ).execute()
 
-
-            log.info(
-                "Sensor reading saved to Supabase"
-            )
-
+            invalidate_history_cache()
 
         except Exception as e:
 
             log.error(
-                "DB insert error: %s",
+                "Sensor DB error: %s",
                 e
             )
 
 
     # ========================================================
-    # CHECK ALERTS
+    # ALERT
     # ========================================================
 
     check_alerts(
-
         temp,
-
         hum,
-
         wetness,
-
         sound
     )
 
 
 # ============================================================
-# HOME PAGE
+# SENSOR WORKER
+# ============================================================
+
+def sensor_worker():
+
+    log.info(
+        "Sensor worker started"
+    )
+
+    while True:
+
+        item = sensor_queue.get()
+
+        try:
+
+            process_sensor_reading(
+                *item
+            )
+
+        except Exception:
+
+            log.exception(
+                "Sensor worker error"
+            )
+
+        finally:
+
+            sensor_queue.task_done()
+
+
+# IMPORTANT:
+# Only ONE database worker by default.
+#
+# This prevents multiple simultaneous Supabase
+# connections from overwhelming a small Render instance.
+
+SENSOR_WORKERS = int(
+    os.getenv(
+        "SENSOR_WORKERS",
+        "1"
+    )
+)
+
+
+for _ in range(
+    max(1, min(SENSOR_WORKERS, 2))
+):
+
+    threading.Thread(
+        target=sensor_worker,
+        daemon=True
+    ).start()
+
+
+# ============================================================
+# HOME
 # ============================================================
 
 @app.route("/")
@@ -802,7 +833,7 @@ def index():
 
 
 # ============================================================
-# LIVE PAGE
+# LIVE
 # ============================================================
 
 @app.route("/live")
@@ -814,7 +845,7 @@ def live():
 
 
 # ============================================================
-# HISTORY PAGE
+# HISTORY
 # ============================================================
 
 @app.route("/history")
@@ -826,81 +857,29 @@ def history():
 
 
 # ============================================================
-# CURRENT SENSOR DATA
+# CURRENT DATA
 # ============================================================
 
-@app.route(
-    "/api/current_data"
-)
+@app.route("/api/current_data")
 def api_current_data():
 
-    return jsonify(
-        current_data
-    )
-
-
-# ============================================================
-# SENSOR HISTORY
-# ============================================================
-
-@app.route(
-    "/api/history"
-)
-def api_history():
-
-    if supabase is None:
-
-        return jsonify([])
-
-
-    limit = request.args.get(
-        "limit",
-        100,
-        type=int
-    )
-
-
-    try:
-
-        response = (
-
-            supabase
-            .table("sensor_readings")
-            .select("*")
-            .order(
-                "created_at",
-                desc=True
-            )
-            .limit(limit)
-            .execute()
-        )
-
+    with current_data_lock:
 
         return jsonify(
-            response.data
+            dict(current_data)
         )
 
 
-    except Exception as e:
-
-        log.error(
-            "History error: %s",
-            e
-        )
-
-        return jsonify({
-            "error": str(e)
-        }), 500
-
-
 # ============================================================
-# ALERT HISTORY
+# HISTORY API
 # ============================================================
 
-@app.route(
-    "/api/alerts"
-)
-def api_alerts():
+@app.route("/api/history")
+def api_history():
+
+    global history_cache
+    global history_cache_time
+
 
     if supabase is None:
 
@@ -913,11 +892,122 @@ def api_alerts():
         type=int
     )
 
+    limit = max(
+        1,
+        min(limit, 100)
+    )
+
+
+    now = time.monotonic()
+
+
+    # ========================================================
+    # CACHE
+    # ========================================================
+
+    with cache_lock:
+
+        if (
+            history_cache is not None
+            and
+            now - history_cache_time < CACHE_SECONDS
+        ):
+
+            return jsonify(
+                history_cache[:limit]
+            )
+
 
     try:
 
         response = (
+            supabase
+            .table("sensor_readings")
+            .select("*")
+            .order(
+                "created_at",
+                desc=True
+            )
+            .limit(limit)
+            .execute()
+        )
 
+
+        data = response.data or []
+
+
+        with cache_lock:
+
+            history_cache = data
+            history_cache_time = time.monotonic()
+
+
+        return jsonify(data)
+
+
+    except Exception as e:
+
+        log.error(
+            "History error: %s",
+            e
+        )
+
+        return jsonify({
+            "error": "Unable to load history"
+        }), 500
+
+
+# ============================================================
+# ALERT HISTORY
+# ============================================================
+
+@app.route("/api/alerts")
+def api_alerts():
+
+    global alerts_cache
+    global alerts_cache_time
+
+
+    if supabase is None:
+
+        return jsonify([])
+
+
+    limit = request.args.get(
+        "limit",
+        20,
+        type=int
+    )
+
+    limit = max(
+        1,
+        min(limit, 50)
+    )
+
+
+    now = time.monotonic()
+
+
+    # ========================================================
+    # CACHE
+    # ========================================================
+
+    with cache_lock:
+
+        if (
+            alerts_cache is not None
+            and
+            now - alerts_cache_time < CACHE_SECONDS
+        ):
+
+            return jsonify(
+                alerts_cache[:limit]
+            )
+
+
+    try:
+
+        response = (
             supabase
             .table("alerts")
             .select("*")
@@ -930,9 +1020,16 @@ def api_alerts():
         )
 
 
-        return jsonify(
-            response.data
-        )
+        data = response.data or []
+
+
+        with cache_lock:
+
+            alerts_cache = data
+            alerts_cache_time = time.monotonic()
+
+
+        return jsonify(data)
 
 
     except Exception as e:
@@ -943,7 +1040,7 @@ def api_alerts():
         )
 
         return jsonify({
-            "error": str(e)
+            "error": "Unable to load alerts"
         }), 500
 
 
@@ -966,16 +1063,34 @@ def clear_alerts():
 
     try:
 
-        supabase.table(
-            "alerts"
-        ).update({
+        (
+            supabase
+            .table("alerts")
+            .update({
+                "is_read": True
+            })
+            .neq(
+                "is_read",
+                True
+            )
+            .execute()
+        )
 
-            "is_read": True
 
-        }).neq(
-            "is_read",
-            True
-        ).execute()
+        invalidate_alert_cache()
+
+
+        try:
+
+            socketio.emit(
+                "alerts_cleared",
+                {
+                    "success": True
+                }
+            )
+
+        except Exception:
+            pass
 
 
         return jsonify({
@@ -985,8 +1100,13 @@ def clear_alerts():
 
     except Exception as e:
 
+        log.error(
+            "Clear alerts error: %s",
+            e
+        )
+
         return jsonify({
-            "error": str(e)
+            "error": "Unable to clear alerts"
         }), 500
 
 
@@ -1005,10 +1125,6 @@ def api_ingest():
     ) or {}
 
 
-    # --------------------------------------------------------
-    # Required fields
-    # --------------------------------------------------------
-
     if (
         "temperature" not in data
         or
@@ -1016,98 +1132,155 @@ def api_ingest():
     ):
 
         return jsonify({
-
             "error":
-                "Missing required fields: "
-                "temperature, humidity"
-
+                "Missing required fields"
         }), 400
 
 
-    # --------------------------------------------------------
-    # Read values
-    # --------------------------------------------------------
+    try:
 
-    temp = data.get(
-        "temperature"
+        temp = float(
+            data["temperature"]
+        )
+
+        hum = float(
+            data["humidity"]
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return jsonify({
+            "error":
+                "Temperature and humidity "
+                "must be numbers"
+        }), 400
+
+
+    motion = bool(
+        data.get(
+            "motion_detected",
+            False
+        )
     )
 
-    hum = data.get(
-        "humidity"
-    )
-
-    motion = data.get(
-        "motion_detected",
-        False
-    )
 
     sound = data.get(
         "sound_level",
         0
     )
 
-    wetness = data.get(
-        "wetness_detected",
-        False
+
+    wetness = bool(
+        data.get(
+            "wetness_detected",
+            False
+        )
     )
 
 
-    # --------------------------------------------------------
-    # Update current dashboard data
-    # --------------------------------------------------------
+    # ========================================================
+    # UPDATE MEMORY IMMEDIATELY
+    # ========================================================
 
-    current_data["temperature"] = temp
+    with current_data_lock:
 
-    current_data["humidity"] = hum
+        current_data.update({
 
-    current_data["motion"] = motion
+            "temperature": temp,
 
-    current_data["sound"] = sound
+            "humidity": hum,
 
-    current_data["wetness"] = wetness
+            "motion": motion,
 
-    current_data["last_update"] = (
-        datetime.now().isoformat()
+            "sound": sound,
+
+            "wetness": wetness,
+
+            "last_update":
+                datetime.now().isoformat()
+        })
+
+
+        socket_data = dict(
+            current_data
+        )
+
+
+    # ========================================================
+    # SEND REAL-TIME SENSOR UPDATE
+    # ========================================================
+
+    try:
+
+        socketio.emit(
+            "sensor_update",
+            socket_data
+        )
+
+    except Exception as e:
+
+        log.debug(
+            "Sensor socket emit failed: %s",
+            e
+        )
+
+
+    # ========================================================
+    # QUEUE DATABASE WORK
+    # ========================================================
+
+    item = (
+        temp,
+        hum,
+        motion,
+        sound,
+        wetness
     )
 
 
-    # --------------------------------------------------------
-    # Push sensor update to dashboard
-    # --------------------------------------------------------
+    try:
 
-    socketio.emit(
-        "sensor_update",
-        current_data
-    )
+        sensor_queue.put_nowait(
+            item
+        )
 
+    except queue.Full:
 
-    # --------------------------------------------------------
-    # Process database + alerts in background
-    # --------------------------------------------------------
+        # Remove the oldest item.
 
-    threading.Thread(
+        try:
 
-        target=_process_reading_async,
+            sensor_queue.get_nowait()
 
-        args=(
-            temp,
-            hum,
-            motion,
-            sound,
-            wetness
-        ),
+            sensor_queue.task_done()
 
-        daemon=True
+        except queue.Empty:
 
-    ).start()
+            pass
 
 
-    # --------------------------------------------------------
-    # Return immediately to Raspberry Pi
-    # --------------------------------------------------------
+        try:
+
+            sensor_queue.put_nowait(
+                item
+            )
+
+        except queue.Full:
+
+            log.warning(
+                "Sensor queue full; "
+                "reading discarded"
+            )
+
+
+    # ========================================================
+    # RESPOND IMMEDIATELY
+    # ========================================================
 
     return jsonify({
-
         "status": "ok",
 
         "abnormal":
@@ -1115,7 +1288,6 @@ def api_ingest():
                 temp,
                 hum
             )
-
     })
 
 
@@ -1132,7 +1304,9 @@ def api_upload_frame():
     global latest_frame
 
 
-    data = request.get_data()
+    data = request.get_data(
+        cache=False
+    )
 
 
     if (
@@ -1142,32 +1316,35 @@ def api_upload_frame():
     ):
 
         return jsonify({
-
-            "error":
-                "Empty or invalid frame"
-
+            "error": "Invalid frame"
         }), 400
 
 
-    with _frame_lock:
+    # ========================================================
+    # KEEP ONLY NEWEST FRAME
+    # ========================================================
+
+    with frame_lock:
 
         latest_frame = data
 
 
-    _broadcast_frame(
+    # ========================================================
+    # BROADCAST
+    # ========================================================
+
+    broadcast_frame(
         data
     )
 
 
     return jsonify({
-
         "status": "ok"
-
     })
 
 
 # ============================================================
-# LIVE VIDEO STREAM
+# VIDEO FEED
 # ============================================================
 
 @app.route(
@@ -1175,47 +1352,51 @@ def api_upload_frame():
 )
 def video_feed():
 
-    """
-    Event-driven MJPEG stream.
-
-    New frames are pushed immediately.
-    Stale frames are discarded.
-    """
-
-
     def generate():
+
+        # ONE FRAME ONLY.
+        #
+        # This is the key to preventing video latency.
 
         q = queue.Queue(
             maxsize=1
         )
 
 
-        with _subscribers_lock:
+        with subscribers_lock:
 
-            _frame_subscribers.append(
+            frame_subscribers.append(
                 q
             )
 
 
         try:
 
-            # Send current frame immediately
+            # =================================================
+            # SEND CURRENT FRAME
+            # =================================================
 
-            with _frame_lock:
+            with frame_lock:
 
-                if latest_frame is not None:
-
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
-                        +
-                        latest_frame
-                        +
-                        b"\r\n"
-                    )
+                frame = latest_frame
 
 
-            # Wait for new frames
+            if frame is not None:
+
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-cache\r\n"
+                    b"Pragma: no-cache\r\n"
+                    b"\r\n"
+                    + frame
+                    + b"\r\n"
+                )
+
+
+            # =================================================
+            # NEW FRAMES
+            # =================================================
 
             while True:
 
@@ -1223,34 +1404,68 @@ def video_feed():
 
 
                 yield (
-
                     b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    +
-                    frame
-                    +
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-cache\r\n"
+                    b"Pragma: no-cache\r\n"
                     b"\r\n"
+                    + frame
+                    + b"\r\n"
                 )
+
+
+        except GeneratorExit:
+
+            pass
+
+
+        except Exception as e:
+
+            log.debug(
+                "Video connection ended: %s",
+                e
+            )
 
 
         finally:
 
-            with _subscribers_lock:
+            with subscribers_lock:
 
-                if q in _frame_subscribers:
+                try:
 
-                    _frame_subscribers.remove(
+                    frame_subscribers.remove(
                         q
                     )
 
+                except ValueError:
+
+                    pass
+
 
     return Response(
-
         generate(),
 
         mimetype=
             "multipart/x-mixed-replace; "
-            "boundary=frame"
+            "boundary=frame",
+
+        headers={
+
+            "Cache-Control":
+                "no-cache, no-store, must-revalidate",
+
+            "Pragma":
+                "no-cache",
+
+            "Expires":
+                "0",
+
+            "X-Accel-Buffering":
+                "no",
+
+            "Connection":
+                "keep-alive"
+        }
     )
 
 
@@ -1275,7 +1490,11 @@ def api_chat():
     ).lower().strip()
 
 
-    d = current_data
+    with current_data_lock:
+
+        d = dict(
+            current_data
+        )
 
 
     temp = (
@@ -1314,25 +1533,17 @@ def api_chat():
 
 
     motion_str = (
-
         "moving"
-
         if d.get("motion")
-
         else
-
         "quiet/sleeping"
     )
 
 
     diaper_str = (
-
         "wet — needs changing"
-
         if d.get("wetness")
-
         else
-
         "dry"
     )
 
@@ -1342,8 +1553,8 @@ def api_chat():
     # ========================================================
 
     if any(
-        w in msg
-        for w in [
+        word in msg
+        for word in [
             "temp",
             "hot",
             "cold",
@@ -1352,7 +1563,6 @@ def api_chat():
     ):
 
         reply = (
-
             f"The current temperature is "
             f"{temp}°C. Safe range is "
             f"{tmin}–{tmax}°C."
@@ -1364,13 +1574,13 @@ def api_chat():
             if temp < float(tmin):
 
                 reply += (
-                    " It's **below** the minimum."
+                    " It is below the minimum."
                 )
 
             elif temp > float(tmax):
 
                 reply += (
-                    " It's **above** the maximum."
+                    " It is above the maximum."
                 )
 
             else:
@@ -1385,15 +1595,14 @@ def api_chat():
     # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+        word in msg
+        for word in [
             "humid",
             "moist"
         ]
     ):
 
         reply = (
-
             f"The current humidity is "
             f"{hum}%. Safe range is "
             f"{hmin}–{hmax}%."
@@ -1405,13 +1614,13 @@ def api_chat():
             if hum < float(hmin):
 
                 reply += (
-                    " It's **below** the minimum."
+                    " It is below the minimum."
                 )
 
             elif hum > float(hmax):
 
                 reply += (
-                    " It's **above** the maximum."
+                    " It is above the maximum."
                 )
 
             else:
@@ -1426,8 +1635,8 @@ def api_chat():
     # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+        word in msg
+        for word in [
             "motion",
             "move",
             "moving",
@@ -1437,23 +1646,9 @@ def api_chat():
     ):
 
         reply = (
-
-            f"Baby is currently **"
-            f"{motion_str}**."
+            f"Baby is currently "
+            f"**{motion_str}**."
         )
-
-
-        if d.get("motion"):
-
-            reply += (
-                " Recent motion was detected."
-            )
-
-        else:
-
-            reply += (
-                " No recent motion was detected."
-            )
 
 
     # ========================================================
@@ -1461,8 +1656,8 @@ def api_chat():
     # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+        word in msg
+        for word in [
             "sound",
             "noise",
             "loud",
@@ -1478,20 +1673,11 @@ def api_chat():
                 "**loud/noisy**."
             )
 
-            reply += (
-                " This may indicate crying "
-                "or a loud environment."
-            )
-
         else:
 
             reply = (
                 "Sound level is currently "
                 "**quiet**."
-            )
-
-            reply += (
-                " No loud sounds detected."
             )
 
 
@@ -1500,8 +1686,8 @@ def api_chat():
     # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+        word in msg
+        for word in [
             "diaper",
             "wet",
             "wee",
@@ -1518,13 +1704,13 @@ def api_chat():
         if d.get("wetness"):
 
             reply += (
-                " It's time for a change!"
+                " It is time for a change."
             )
 
         else:
 
             reply += (
-                " All good, no change needed."
+                " No wetness detected."
             )
 
 
@@ -1533,8 +1719,8 @@ def api_chat():
     # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+        word in msg
+        for word in [
             "hi",
             "hello",
             "hey",
@@ -1543,11 +1729,10 @@ def api_chat():
     ):
 
         reply = (
-
             "Hello! I'm your Baby Cradle "
             "Monitoring assistant. Ask about "
-            "**temperature**, **humidity**, "
-            "**motion**, **sound**, or **diaper**."
+            "temperature, humidity, motion, "
+            "sound, diaper, or status."
         )
 
 
@@ -1556,8 +1741,8 @@ def api_chat():
     # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+        word in msg
+        for word in [
             "status",
             "summary",
             "all",
@@ -1583,33 +1768,21 @@ def api_chat():
 
 
         if check_abnormal(
-
-            temp
-            if temp != "--"
-            else None,
-
-            hum
-            if hum != "--"
-            else None
-
+            temp if temp != "--" else None,
+            hum if hum != "--" else None
         ):
 
             flags.append(
-                "⚠️ abnormal readings"
+                "abnormal readings"
             )
 
 
         reply = (
-
             f"**Temperature:** {temp}°C  |  "
-
             f"**Humidity:** {hum}%  |  "
-
             f"**Motion:** {motion_str}  |  "
-
             f"**Sound:** "
             f"{'loud' if d.get('sound') else 'quiet'}  |  "
-
             f"**Diaper:** {diaper_str}"
         )
 
@@ -1617,23 +1790,17 @@ def api_chat():
         if flags:
 
             reply += (
-                f"\n\nNotable: "
-                f"{' · '.join(flags)}"
+                "\n\nNotable: "
+                + " · ".join(flags)
             )
 
-
-    # ========================================================
-    # UNKNOWN QUESTION
-    # ========================================================
 
     else:
 
         reply = (
-
-            "I can answer about: "
-            "**temperature**, **humidity**, "
-            "**motion**, **sound**, **diaper**, "
-            "or say **status** for a full summary."
+            "I can answer about temperature, "
+            "humidity, motion, sound, diaper, "
+            "or status."
         )
 
 
@@ -1643,7 +1810,53 @@ def api_chat():
 
 
 # ============================================================
-# START SERVER
+# HEALTH
+# ============================================================
+
+@app.route("/health")
+def health():
+
+    return jsonify({
+
+        "status": "healthy",
+
+        "database":
+            supabase is not None,
+
+        "sensor_queue":
+            sensor_queue.qsize(),
+
+        "email_queue":
+            email_queue.qsize(),
+
+        "video_clients":
+            len(frame_subscribers)
+
+    })
+
+
+# ============================================================
+# SOCKET.IO EVENTS
+# ============================================================
+
+@socketio.on("connect")
+def socket_connect():
+
+    log.info(
+        "Socket.IO client connected"
+    )
+
+
+@socketio.on("disconnect")
+def socket_disconnect():
+
+    log.info(
+        "Socket.IO client disconnected"
+    )
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
@@ -1651,33 +1864,26 @@ if __name__ == "__main__":
     port = int(
         os.getenv(
             "PORT",
-            5000
+            "5000"
         )
-    )
-
-
-    debug = (
-        os.getenv("RENDER")
-        is None
     )
 
 
     log.info(
         "Baby Cradle Monitoring Server "
-        "starting on port %s...",
+        "starting on port %s",
         port
     )
 
 
     socketio.run(
-
         app,
 
         host="0.0.0.0",
 
         port=port,
 
-        debug=debug,
+        debug=False,
 
         allow_unsafe_werkzeug=True
     )
