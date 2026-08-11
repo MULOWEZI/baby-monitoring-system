@@ -39,6 +39,7 @@ Werkzeug==3.1.8
 yarl==1.24.5
 requests==2.32.5
 gunicorn==23.0.0
+gevent
 Flask-SocketIO==5.5.1
 python-dotenv==1.1.1
 gevent
