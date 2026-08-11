@@ -200,7 +200,7 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
     <div class="panel">
       <div class="panel-header"><span class="dot-accent"></span><h2>Live Camera</h2><span class="sub">Real-time feed</span></div>
       <div class="video-box">
-        <img src="/video_feed" alt="Live Camera" id="dashCam" style="display:none;">
+        <img alt="Live Camera" id="dashCam" style="display:none;">
         <div class="video-empty" id="dashCamEmpty"><div class="big">📷</div><div>Waiting for camera feed...</div></div>
       </div>
       <a href="/live" class="video-link">Open full live view →</a>
@@ -232,7 +232,13 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
 </main>
 
 <script>
-const socket = io();
+const socket = io({
+  transports: ['websocket', 'polling'],
+  reconnection: true,
+  reconnectionAttempts: 5,
+  reconnectionDelay: 1000,
+  timeout: 5000
+});
 let lastUpdateTs = null;
 
 const hamburger = document.getElementById('hamburgerBtn');
@@ -410,7 +416,29 @@ dashCam.onerror = ()=>{ dashCam.style.display='none'; dashCamEmpty.style.display
 loadCurrentData();
 loadHistory();
 loadAlerts();
-setInterval(()=>{ loadHistory(); loadAlerts(); }, 30000);
+
+// Keep dashboard lightweight: it does NOT keep a permanent MJPEG stream
+// open. The dedicated Live page owns the video connection.
+let dashboardRefreshTimer = setInterval(() => {
+  loadHistory();
+  loadAlerts();
+}, 60000);
+
+function cleanupDashboardPage() {
+  if (dashboardRefreshTimer) {
+    clearInterval(dashboardRefreshTimer);
+    dashboardRefreshTimer = null;
+  }
+  try {
+    if (socket && socket.connected) socket.disconnect();
+  } catch (e) {}
+}
+
+window.addEventListener('pagehide', cleanupDashboardPage, { once: true });
+window.addEventListener('beforeunload', cleanupDashboardPage, { once: true });
+document.querySelectorAll('.sidebar-nav a').forEach(link => {
+  link.addEventListener('click', cleanupDashboardPage, { once: true });
+});
 </script>
 </body>
 </html>
