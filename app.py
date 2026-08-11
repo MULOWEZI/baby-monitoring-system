@@ -16,23 +16,23 @@ from dotenv import load_dotenv
 
 
 # ============================================================
-# ENVIRONMENT
-# ============================================================
-
-load_dotenv()
-
-
-# ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "WARNING"),
+    level=logging.INFO,
     stream=sys.stdout,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
 log = logging.getLogger(__name__)
+
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
+load_dotenv()
 
 
 # ============================================================
@@ -50,6 +50,17 @@ app.config["SECRET_KEY"] = os.getenv(
 # ============================================================
 # SOCKET.IO
 # ============================================================
+#
+# IMPORTANT:
+# This application uses normal Python threads and blocking
+# Supabase/HTTP requests.
+#
+# Therefore use:
+#
+# gunicorn --worker-class gthread --workers 1 --threads 8 app:app
+#
+# NOT gevent.
+# ============================================================
 
 socketio = SocketIO(
     app,
@@ -57,13 +68,8 @@ socketio = SocketIO(
     async_mode="threading",
     logger=False,
     engineio_logger=False,
-
-    # Keep connections alive.
     ping_interval=25,
-    ping_timeout=60,
-
-    # Avoid unnecessary Socket.IO compression overhead.
-    compression_threshold=1024
+    ping_timeout=60
 )
 
 
@@ -74,7 +80,7 @@ socketio = SocketIO(
 SUPABASE_URL = os.getenv(
     "SUPABASE_URL",
     ""
-).rstrip("/")
+)
 
 SUPABASE_KEY = os.getenv(
     "SUPABASE_KEY",
@@ -82,6 +88,7 @@ SUPABASE_KEY = os.getenv(
 )
 
 supabase = None
+
 
 if SUPABASE_URL and SUPABASE_KEY:
 
@@ -106,7 +113,7 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
 
     log.warning(
-        "Supabase disabled: missing SUPABASE_URL or SUPABASE_KEY"
+        "SUPABASE_URL/KEY not set - database disabled"
     )
 
 
@@ -127,7 +134,47 @@ current_data_lock = threading.Lock()
 
 
 # ============================================================
-# VIDEO
+# DATABASE CACHE
+# ============================================================
+#
+# Dashboard navigation can repeatedly request history/alerts.
+# Instead of hitting Supabase every single time, keep a small
+# cache for a few seconds.
+# ============================================================
+
+CACHE_TTL = 5.0
+
+history_cache = {
+    "data": [],
+    "timestamp": 0,
+    "limit": 50
+}
+
+alerts_cache = {
+    "data": [],
+    "timestamp": 0,
+    "limit": 20
+}
+
+cache_lock = threading.Lock()
+
+
+def invalidate_history_cache():
+
+    with cache_lock:
+
+        history_cache["timestamp"] = 0
+
+
+def invalidate_alerts_cache():
+
+    with cache_lock:
+
+        alerts_cache["timestamp"] = 0
+
+
+# ============================================================
+# VIDEO STREAM
 # ============================================================
 
 latest_frame = None
@@ -156,56 +203,49 @@ def _broadcast_frame(frame):
         except queue.Full:
 
             try:
+
                 q.get_nowait()
+
             except queue.Empty:
+
                 pass
 
             try:
+
                 q.put_nowait(frame)
+
             except queue.Full:
+
                 pass
+
+
+# ============================================================
+# SENSOR READING QUEUE
+# ============================================================
+#
+# IMPORTANT:
+# This is defined BEFORE sensor_worker().
+#
+# This fixes:
+#
+# NameError: name 'reading_queue' is not defined
+# ============================================================
+
+READING_QUEUE_SIZE = 100
+
+reading_queue = queue.Queue(
+    maxsize=READING_QUEUE_SIZE
+)
 
 
 # ============================================================
 # DATABASE QUEUE
 # ============================================================
 
-# Sensor processing and database writing are separated.
-#
-# This prevents Supabase from slowing down:
-#
-#   /api/ingest
-#   dashboard navigation
-#   Socket.IO
-#   video
-#
-# ============================================================
+DATABASE_QUEUE_SIZE = 200
 
-DB_QUEUE_SIZE = int(
-    os.getenv(
-        "DB_QUEUE_SIZE",
-        "200"
-    )
-)
-
-db_queue = queue.Queue(
-    maxsize=DB_QUEUE_SIZE
-)
-
-
-# ============================================================
-# ALERT QUEUE
-# ============================================================
-
-ALERT_QUEUE_SIZE = int(
-    os.getenv(
-        "ALERT_QUEUE_SIZE",
-        "100"
-    )
-)
-
-alert_queue = queue.Queue(
-    maxsize=ALERT_QUEUE_SIZE
+database_queue = queue.Queue(
+    maxsize=DATABASE_QUEUE_SIZE
 )
 
 
@@ -213,97 +253,11 @@ alert_queue = queue.Queue(
 # EMAIL QUEUE
 # ============================================================
 
-EMAIL_QUEUE_SIZE = int(
-    os.getenv(
-        "EMAIL_QUEUE_SIZE",
-        "50"
-    )
-)
+EMAIL_QUEUE_SIZE = 20
 
 email_queue = queue.Queue(
     maxsize=EMAIL_QUEUE_SIZE
 )
-
-
-# ============================================================
-# CACHE
-# ============================================================
-
-history_cache = {
-    "data": [],
-    "time": 0
-}
-
-alerts_cache = {
-    "data": [],
-    "time": 0
-}
-
-cache_lock = threading.Lock()
-
-CACHE_SECONDS = float(
-    os.getenv(
-        "CACHE_SECONDS",
-        "3"
-    )
-)
-
-
-def invalidate_history_cache():
-
-    with cache_lock:
-
-        history_cache["time"] = 0
-
-
-def invalidate_alerts_cache():
-
-    with cache_lock:
-
-        alerts_cache["time"] = 0
-
-
-# ============================================================
-# DATABASE WRITE RATE LIMIT
-# ============================================================
-
-# Do not write every single Raspberry Pi reading to Supabase.
-#
-# The Pi can still send data very frequently.
-# The dashboard gets the latest data immediately.
-#
-# Supabase receives samples at a controlled rate.
-
-DB_SAVE_INTERVAL = float(
-    os.getenv(
-        "DB_SAVE_INTERVAL",
-        "1.0"
-    )
-)
-
-last_db_save = 0
-
-last_db_save_lock = threading.Lock()
-
-
-def should_save_to_database():
-
-    global last_db_save
-
-    now = time.monotonic()
-
-    with last_db_save_lock:
-
-        if (
-            now - last_db_save
-            >= DB_SAVE_INTERVAL
-        ):
-
-            last_db_save = now
-
-            return True
-
-    return False
 
 
 # ============================================================
@@ -367,9 +321,17 @@ def send_alert_email(alerts):
 
     if not BIRD_API_KEY:
 
+        log.warning(
+            "BIRD_API_KEY not set - email skipped"
+        )
+
         return False
 
     if not ALERT_EMAIL:
+
+        log.warning(
+            "ALERT_EMAIL not set - email skipped"
+        )
 
         return False
 
@@ -382,15 +344,15 @@ def send_alert_email(alerts):
 
     if "wetness" in alert_types:
 
-        subject = "💧 Wet Diaper Detected"
+        subject = "Wet Diaper Detected"
 
     elif "temperature" in alert_types:
 
-        subject = "🌡️ Temperature Alert"
+        subject = "Temperature Alert"
 
     else:
 
-        subject = "🚼 Baby Monitoring Alert"
+        subject = "Baby Monitoring Alert"
 
 
     items = ""
@@ -401,7 +363,7 @@ def send_alert_email(alerts):
             "<li>"
             f"<strong>"
             f"{alert.get('severity', 'warning').upper()}"
-            f"</strong> — "
+            f"</strong> - "
             f"{alert.get('message', '')}"
             "</li>"
         )
@@ -422,7 +384,7 @@ def send_alert_email(alerts):
     <html>
     <body>
 
-        <h2>🚼 Baby Cradle Monitoring Alert</h2>
+        <h2>Baby Cradle Monitoring Alert</h2>
 
         <p>
             A new condition requiring attention
@@ -454,11 +416,15 @@ def send_alert_email(alerts):
 
 
     payload = {
+
         "from": BIRD_SENDER,
+
         "to": [
             ALERT_EMAIL
         ],
+
         "subject": subject,
+
         "html": html
     }
 
@@ -466,6 +432,7 @@ def send_alert_email(alerts):
     try:
 
         response = requests.post(
+
             f"{bird_host()}/v1/email/messages",
 
             headers={
@@ -478,7 +445,7 @@ def send_alert_email(alerts):
 
             json=payload,
 
-            timeout=10
+            timeout=15
         )
 
 
@@ -487,7 +454,7 @@ def send_alert_email(alerts):
             202
         ):
 
-            log.warning(
+            log.info(
                 "Alert email sent"
             )
 
@@ -495,57 +462,21 @@ def send_alert_email(alerts):
 
 
         log.error(
-            "Bird email failed: %s",
-            response.status_code
+            "Bird email failed %s: %s",
+            response.status_code,
+            response.text[:300]
         )
 
 
     except Exception as e:
 
-        log.error(
+        log.exception(
             "Bird email exception: %s",
             e
         )
 
 
     return False
-
-
-# ============================================================
-# THRESHOLDS
-# ============================================================
-
-def get_thresholds():
-
-    return (
-        float(
-            os.getenv(
-                "TEMP_MIN",
-                "20"
-            )
-        ),
-
-        float(
-            os.getenv(
-                "TEMP_MAX",
-                "25"
-            )
-        ),
-
-        float(
-            os.getenv(
-                "HUMIDITY_MIN",
-                "40"
-            )
-        ),
-
-        float(
-            os.getenv(
-                "HUMIDITY_MAX",
-                "60"
-            )
-        )
-    )
 
 
 # ============================================================
@@ -557,9 +488,39 @@ def check_abnormal(
     hum
 ):
 
-    temp_min, temp_max, hum_min, hum_max = (
-        get_thresholds()
-    )
+    try:
+
+        temp_min = float(
+            os.getenv(
+                "TEMP_MIN",
+                "20"
+            )
+        )
+
+        temp_max = float(
+            os.getenv(
+                "TEMP_MAX",
+                "25"
+            )
+        )
+
+        hum_min = float(
+            os.getenv(
+                "HUMIDITY_MIN",
+                "40"
+            )
+        )
+
+        hum_max = float(
+            os.getenv(
+                "HUMIDITY_MAX",
+                "60"
+            )
+        )
+
+    except ValueError:
+
+        return False
 
 
     if temp is not None:
@@ -588,10 +549,10 @@ def check_abnormal(
 
 
 # ============================================================
-# CREATE ALERTS
+# ALERT DETECTION
 # ============================================================
 
-def detect_alerts(
+def check_alerts(
     temp,
     hum,
     wetness,
@@ -602,36 +563,70 @@ def detect_alerts(
     global previous_temperature_abnormal
 
 
-    temp_min, temp_max, _, _ = (
-        get_thresholds()
-    )
+    try:
+
+        temp_min = float(
+            os.getenv(
+                "TEMP_MIN",
+                "20"
+            )
+        )
+
+        temp_max = float(
+            os.getenv(
+                "TEMP_MAX",
+                "25"
+            )
+        )
+
+    except ValueError:
+
+        temp_min = 20
+        temp_max = 25
 
 
     alerts = []
 
 
-    temperature_abnormal = False
+    # ========================================================
+    # TEMPERATURE
+    # ========================================================
 
+    temperature_abnormal = False
 
     if temp is not None:
 
         temperature_abnormal = (
+
             temp < temp_min
+
             or
+
             temp > temp_max
         )
 
+
+    # ========================================================
+    # WETNESS
+    # ========================================================
 
     current_wetness = bool(
         wetness
     )
 
 
+    # ========================================================
+    # UPDATE STATE
+    # ========================================================
+
     with alert_state_lock:
 
         new_temperature_event = (
+
             temperature_abnormal
+
             and
+
             not previous_temperature_abnormal
         )
 
@@ -641,7 +636,7 @@ def detect_alerts(
             if temp > temp_max:
 
                 message = (
-                    f"🌡️ Temperature is too high: "
+                    f"Temperature is too high: "
                     f"{temp}°C. "
                     f"Configured maximum is "
                     f"{temp_max}°C."
@@ -650,7 +645,7 @@ def detect_alerts(
             elif temp < temp_min:
 
                 message = (
-                    f"🌡️ Temperature is too low: "
+                    f"Temperature is too low: "
                     f"{temp}°C. "
                     f"Configured minimum is "
                     f"{temp_min}°C."
@@ -659,15 +654,21 @@ def detect_alerts(
             else:
 
                 message = (
-                    f"🌡️ Abnormal temperature detected: "
+                    f"Abnormal temperature detected: "
                     f"{temp}°C."
                 )
 
 
             alerts.append({
-                "alert_type": "temperature",
-                "severity": "critical",
-                "message": message
+
+                "alert_type":
+                    "temperature",
+
+                "severity":
+                    "critical",
+
+                "message":
+                    message
             })
 
 
@@ -676,13 +677,16 @@ def detect_alerts(
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # WETNESS
-        # ----------------------------------------------------
+        # ====================================================
 
         new_wetness_event = (
+
             current_wetness
+
             and
+
             not previous_wetness
         )
 
@@ -690,10 +694,15 @@ def detect_alerts(
         if new_wetness_event:
 
             alerts.append({
-                "alert_type": "wetness",
-                "severity": "critical",
+
+                "alert_type":
+                    "wetness",
+
+                "severity":
+                    "critical",
+
                 "message":
-                    "💧 Diaper is wet! "
+                    "Diaper is wet! "
                     "Please change the diaper."
             })
 
@@ -703,222 +712,78 @@ def detect_alerts(
         )
 
 
-    return alerts
-
-
-# ============================================================
-# SAVE SENSOR READING
-# ============================================================
-
-def save_sensor_reading(
-    temp,
-    hum,
-    motion,
-    sound,
-    wetness
-):
-
-    if supabase is None:
+    if not alerts:
 
         return
 
 
-    reading = {
-        "temperature": temp,
-        "humidity": hum,
-        "motion_detected": motion,
-        "sound_level": sound,
-        "wetness_detected": wetness,
-        "is_abnormal":
-            check_abnormal(
-                temp,
-                hum
-            )
-    }
+    # ========================================================
+    # SEND ALERT TO DASHBOARD IMMEDIATELY
+    # ========================================================
 
-
-    try:
-
-        (
-            supabase
-            .table("sensor_readings")
-            .insert(reading)
-            .execute()
-        )
-
-
-        invalidate_history_cache()
-
-
-    except Exception as e:
-
-        log.error(
-            "Sensor database error: %s",
-            e
-        )
-
-
-# ============================================================
-# SAVE ALERT
-# ============================================================
-
-def save_alert(alert):
-
-    if supabase is None:
-
-        return
-
-
-    try:
-
-        (
-            supabase
-            .table("alerts")
-            .insert(alert)
-            .execute()
-        )
-
-
-        invalidate_alerts_cache()
-
-
-    except Exception as e:
-
-        log.error(
-            "Alert database error: %s",
-            e
-        )
-
-
-# ============================================================
-# DATABASE WORKER
-# ============================================================
-
-def database_worker():
-
-    log.warning(
-        "Database worker started"
-    )
-
-
-    while True:
-
-        item = db_queue.get()
+    for alert in alerts:
 
         try:
 
-            save_sensor_reading(
-                *item
+            socketio.emit(
+                "new_alert",
+                alert
             )
 
         except Exception as e:
 
-            log.error(
-                "Database worker error: %s",
+            log.debug(
+                "Socket alert failed: %s",
                 e
             )
 
-        finally:
 
-            db_queue.task_done()
+    # ========================================================
+    # DATABASE ALERT INSERT
+    # ========================================================
 
-
-# ============================================================
-# ALERT WORKER
-# ============================================================
-
-def alert_worker():
-
-    log.warning(
-        "Alert worker started"
-    )
-
-
-    while True:
-
-        alerts = alert_queue.get()
+    for alert in alerts:
 
         try:
 
-            for alert in alerts:
+            database_queue.put_nowait({
 
-                save_alert(
+                "type":
+                    "alert",
+
+                "data":
                     alert
-                )
+            })
 
-                try:
+        except queue.Full:
 
-                    socketio.emit(
-                        "new_alert",
-                        alert
-                    )
-
-                except Exception:
-                    pass
-
-
-            # Email is placed into a different queue.
-
-            try:
-
-                email_queue.put_nowait(
-                    alerts
-                )
-
-            except queue.Full:
-
-                log.warning(
-                    "Email queue full"
-                )
-
-
-        except Exception as e:
-
-            log.error(
-                "Alert worker error: %s",
-                e
+            log.warning(
+                "Database queue full - alert dropped"
             )
 
-        finally:
 
-            alert_queue.task_done()
+    # ========================================================
+    # EMAIL
+    # ========================================================
+    #
+    # Email is NEVER sent inside the HTTP request.
+    # ========================================================
+
+    try:
+
+        email_queue.put_nowait(
+            alerts
+        )
+
+    except queue.Full:
+
+        log.warning(
+            "Email queue full - email skipped"
+        )
 
 
 # ============================================================
-# EMAIL WORKER
-# ============================================================
-
-def email_worker():
-
-    log.warning(
-        "Email worker started"
-    )
-
-
-    while True:
-
-        alerts = email_queue.get()
-
-        try:
-
-            send_alert_email(
-                alerts
-            )
-
-        except Exception as e:
-
-            log.error(
-                "Email worker error: %s",
-                e
-            )
-
-        finally:
-
-            email_queue.task_done()
-
-
-# ============================================================
-# SENSOR PROCESSING
+# PROCESS SENSOR READING
 # ============================================================
 
 def process_sensor_reading(
@@ -929,42 +794,14 @@ def process_sensor_reading(
     wetness
 ):
 
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
+    # ========================================================
+    # DETECT ALERTS FIRST
+    # ========================================================
+    #
+    # This is fast and does not wait for Supabase.
+    # ========================================================
 
-    if should_save_to_database():
-
-        item = (
-            temp,
-            hum,
-            motion,
-            sound,
-            wetness
-        )
-
-
-        try:
-
-            db_queue.put_nowait(
-                item
-            )
-
-        except queue.Full:
-
-            # Drop database sample rather than blocking
-            # the live monitoring system.
-
-            log.warning(
-                "Database queue full; dropping sample"
-            )
-
-
-    # --------------------------------------------------------
-    # ALERT DETECTION
-    # --------------------------------------------------------
-
-    alerts = detect_alerts(
+    check_alerts(
         temp,
         hum,
         wetness,
@@ -972,18 +809,78 @@ def process_sensor_reading(
     )
 
 
-    if alerts:
+    # ========================================================
+    # QUEUE DATABASE WRITE
+    # ========================================================
+
+    reading = {
+
+        "temperature":
+            temp,
+
+        "humidity":
+            hum,
+
+        "motion_detected":
+            motion,
+
+        "sound_level":
+            sound,
+
+        "wetness_detected":
+            wetness,
+
+        "is_abnormal":
+            check_abnormal(
+                temp,
+                hum
+            )
+    }
+
+
+    try:
+
+        database_queue.put_nowait({
+
+            "type":
+                "sensor",
+
+            "data":
+                reading
+        })
+
+
+    except queue.Full:
+
+        # Drop old database data rather than blocking
+        # incoming sensor requests.
 
         try:
 
-            alert_queue.put_nowait(
-                alerts
-            )
+            database_queue.get_nowait()
+
+            database_queue.task_done()
+
+        except queue.Empty:
+
+            pass
+
+
+        try:
+
+            database_queue.put_nowait({
+
+                "type":
+                    "sensor",
+
+                "data":
+                    reading
+            })
 
         except queue.Full:
 
             log.warning(
-                "Alert queue full"
+                "Database queue full - reading dropped"
             )
 
 
@@ -1008,11 +905,10 @@ def sensor_worker():
                 *item
             )
 
-        except Exception as e:
+        except Exception:
 
-            log.error(
-                "Sensor processing error: %s",
-                e
+            log.exception(
+                "Sensor processing error"
             )
 
         finally:
@@ -1021,64 +917,145 @@ def sensor_worker():
 
 
 # ============================================================
-# START BACKGROUND WORKERS
+# DATABASE WORKER
 # ============================================================
 
-def start_workers():
+def database_worker():
 
-    # Only start once per process.
-
-    if getattr(
-        start_workers,
-        "_started",
-        False
-    ):
-
-        return
-
-
-    start_workers._started = True
-
-
-    sensor_thread = threading.Thread(
-        target=sensor_worker,
-        daemon=True,
-        name="sensor-worker"
+    log.warning(
+        "Database worker started"
     )
 
-    sensor_thread.start()
+
+    while True:
+
+        job = database_queue.get()
+
+        try:
+
+            if supabase is None:
+
+                continue
 
 
-    database_thread = threading.Thread(
-        target=database_worker,
-        daemon=True,
-        name="database-worker"
+            job_type = job.get(
+                "type"
+            )
+
+            data = job.get(
+                "data"
+            )
+
+
+            # =================================================
+            # SENSOR READING
+            # =================================================
+
+            if job_type == "sensor":
+
+                supabase.table(
+                    "sensor_readings"
+                ).insert(
+                    data
+                ).execute()
+
+
+                invalidate_history_cache()
+
+
+            # =================================================
+            # ALERT
+            # =================================================
+
+            elif job_type == "alert":
+
+                supabase.table(
+                    "alerts"
+                ).insert(
+                    data
+                ).execute()
+
+
+                invalidate_alerts_cache()
+
+
+        except Exception as e:
+
+            log.error(
+                "Database worker error: %s",
+                e
+            )
+
+        finally:
+
+            database_queue.task_done()
+
+
+# ============================================================
+# EMAIL WORKER
+# ============================================================
+
+def email_worker():
+
+    log.warning(
+        "Email worker started"
     )
 
-    database_thread.start()
+
+    while True:
+
+        alerts = email_queue.get()
+
+        try:
+
+            send_alert_email(
+                alerts
+            )
+
+        except Exception:
+
+            log.exception(
+                "Email worker error"
+            )
+
+        finally:
+
+            email_queue.task_done()
 
 
-    alert_thread = threading.Thread(
-        target=alert_worker,
-        daemon=True,
-        name="alert-worker"
-    )
+# ============================================================
+# START BACKGROUND WORKERS
+# ============================================================
+#
+# IMPORTANT:
+# Queues are already defined above.
+# ============================================================
 
-    alert_thread.start()
+sensor_thread = threading.Thread(
+    target=sensor_worker,
+    daemon=True,
+    name="sensor-worker"
+)
+
+sensor_thread.start()
 
 
-    email_thread = threading.Thread(
-        target=email_worker,
-        daemon=True,
-        name="email-worker"
-    )
+database_thread = threading.Thread(
+    target=database_worker,
+    daemon=True,
+    name="database-worker"
+)
 
-    email_thread.start()
+database_thread.start()
 
 
-# Start workers when module loads.
+email_thread = threading.Thread(
+    target=email_worker,
+    daemon=True,
+    name="email-worker"
+)
 
-start_workers()
+email_thread.start()
 
 
 # ============================================================
@@ -1088,8 +1065,16 @@ start_workers()
 @app.route("/")
 def index():
 
-    return render_template(
+    response = render_template(
         "index.html"
+    )
+
+    return Response(
+        response,
+        headers={
+            "Cache-Control":
+                "no-cache"
+        }
     )
 
 
@@ -1100,8 +1085,16 @@ def index():
 @app.route("/live")
 def live():
 
-    return render_template(
+    response = render_template(
         "live.html"
+    )
+
+    return Response(
+        response,
+        headers={
+            "Cache-Control":
+                "no-cache"
+        }
     )
 
 
@@ -1112,8 +1105,16 @@ def live():
 @app.route("/history")
 def history():
 
-    return render_template(
+    response = render_template(
         "history.html"
+    )
+
+    return Response(
+        response,
+        headers={
+            "Cache-Control":
+                "no-cache"
+        }
     )
 
 
@@ -1121,7 +1122,9 @@ def history():
 # CURRENT DATA
 # ============================================================
 
-@app.route("/api/current_data")
+@app.route(
+    "/api/current_data"
+)
 def api_current_data():
 
     with current_data_lock:
@@ -1131,14 +1134,25 @@ def api_current_data():
         )
 
 
-    return jsonify(data)
+    response = jsonify(
+        data
+    )
+
+    response.headers[
+        "Cache-Control"
+    ] = "no-store"
+
+
+    return response
 
 
 # ============================================================
 # SENSOR HISTORY
 # ============================================================
 
-@app.route("/api/history")
+@app.route(
+    "/api/history"
+)
 def api_history():
 
     if supabase is None:
@@ -1162,57 +1176,98 @@ def api_history():
     now = time.monotonic()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # CACHE
-    # --------------------------------------------------------
+    # ========================================================
 
     with cache_lock:
 
+        cached_data = history_cache[
+            "data"
+        ]
+
+        cached_time = history_cache[
+            "timestamp"
+        ]
+
+        cached_limit = history_cache[
+            "limit"
+        ]
+
+
         if (
-            history_cache["data"]
+
+            cached_limit == limit
+
             and
-            now - history_cache["time"]
-            < CACHE_SECONDS
+
+            cached_data
+
+            and
+
+            now - cached_time < CACHE_TTL
+
         ):
 
             return jsonify(
-                history_cache["data"][:limit]
+                cached_data
             )
 
 
-    # --------------------------------------------------------
-    # SUPABASE
-    # --------------------------------------------------------
+    # ========================================================
+    # DATABASE
+    # ========================================================
 
     try:
 
         response = (
+
             supabase
-            .table("sensor_readings")
-            .select("*")
+
+            .table(
+                "sensor_readings"
+            )
+
+            .select(
+                "*"
+            )
+
             .order(
                 "created_at",
                 desc=True
             )
-            .limit(100)
+
+            .limit(
+                limit
+            )
+
             .execute()
         )
 
 
-        data = response.data or []
+        data = (
+            response.data
+            or []
+        )
 
 
         with cache_lock:
 
-            history_cache["data"] = data
+            history_cache[
+                "data"
+            ] = data
 
-            history_cache["time"] = (
-                time.monotonic()
-            )
+            history_cache[
+                "timestamp"
+            ] = time.monotonic()
+
+            history_cache[
+                "limit"
+            ] = limit
 
 
         return jsonify(
-            data[:limit]
+            data
         )
 
 
@@ -1224,26 +1279,11 @@ def api_history():
         )
 
 
-        # If database temporarily fails,
-        # return cached data if available.
-
-        with cache_lock:
-
-            cached = list(
-                history_cache["data"]
-            )
-
-
-        if cached:
-
-            return jsonify(
-                cached[:limit]
-            )
-
-
         return jsonify({
+
             "error":
                 "Unable to load history"
+
         }), 500
 
 
@@ -1251,7 +1291,9 @@ def api_history():
 # ALERT HISTORY
 # ============================================================
 
-@app.route("/api/alerts")
+@app.route(
+    "/api/alerts"
+)
 def api_alerts():
 
     if supabase is None:
@@ -1275,57 +1317,98 @@ def api_alerts():
     now = time.monotonic()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # CACHE
-    # --------------------------------------------------------
+    # ========================================================
 
     with cache_lock:
 
+        cached_data = alerts_cache[
+            "data"
+        ]
+
+        cached_time = alerts_cache[
+            "timestamp"
+        ]
+
+        cached_limit = alerts_cache[
+            "limit"
+        ]
+
+
         if (
-            alerts_cache["data"]
+
+            cached_limit == limit
+
             and
-            now - alerts_cache["time"]
-            < CACHE_SECONDS
+
+            cached_data
+
+            and
+
+            now - cached_time < CACHE_TTL
+
         ):
 
             return jsonify(
-                alerts_cache["data"][:limit]
+                cached_data
             )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # DATABASE
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
 
         response = (
+
             supabase
-            .table("alerts")
-            .select("*")
+
+            .table(
+                "alerts"
+            )
+
+            .select(
+                "*"
+            )
+
             .order(
                 "created_at",
                 desc=True
             )
-            .limit(50)
+
+            .limit(
+                limit
+            )
+
             .execute()
         )
 
 
-        data = response.data or []
+        data = (
+            response.data
+            or []
+        )
 
 
         with cache_lock:
 
-            alerts_cache["data"] = data
+            alerts_cache[
+                "data"
+            ] = data
 
-            alerts_cache["time"] = (
-                time.monotonic()
-            )
+            alerts_cache[
+                "timestamp"
+            ] = time.monotonic()
+
+            alerts_cache[
+                "limit"
+            ] = limit
 
 
         return jsonify(
-            data[:limit]
+            data
         )
 
 
@@ -1337,23 +1420,11 @@ def api_alerts():
         )
 
 
-        with cache_lock:
-
-            cached = list(
-                alerts_cache["data"]
-            )
-
-
-        if cached:
-
-            return jsonify(
-                cached[:limit]
-            )
-
-
         return jsonify({
+
             "error":
                 "Unable to load alerts"
+
         }), 500
 
 
@@ -1377,15 +1448,23 @@ def clear_alerts():
     try:
 
         (
+
             supabase
-            .table("alerts")
+
+            .table(
+                "alerts"
+            )
+
             .update({
-                "is_read": True
+                "is_read":
+                    True
             })
+
             .neq(
                 "is_read",
                 True
             )
+
             .execute()
         )
 
@@ -1394,7 +1473,9 @@ def clear_alerts():
 
 
         return jsonify({
-            "success": True
+
+            "success":
+                True
         })
 
 
@@ -1407,8 +1488,10 @@ def clear_alerts():
 
 
         return jsonify({
+
             "error":
                 "Unable to clear alerts"
+
         }), 500
 
 
@@ -1427,27 +1510,45 @@ def api_ingest():
     ) or {}
 
 
+    # ========================================================
+    # REQUIRED DATA
+    # ========================================================
+
     if (
+
         "temperature" not in data
+
         or
+
         "humidity" not in data
+
     ):
 
         return jsonify({
+
             "error":
                 "Missing required fields: "
                 "temperature, humidity"
+
         }), 400
 
+
+    # ========================================================
+    # CONVERT VALUES
+    # ========================================================
 
     try:
 
         temp = float(
-            data["temperature"]
+            data.get(
+                "temperature"
+            )
         )
 
         hum = float(
-            data["humidity"]
+            data.get(
+                "humidity"
+            )
         )
 
     except (
@@ -1456,9 +1557,11 @@ def api_ingest():
     ):
 
         return jsonify({
+
             "error":
                 "Temperature and humidity "
                 "must be numbers"
+
         }), 400
 
 
@@ -1484,54 +1587,82 @@ def api_ingest():
     )
 
 
-    timestamp = (
-        datetime.now().isoformat()
-    )
-
-
     # ========================================================
-    # UPDATE MEMORY IMMEDIATELY
+    # UPDATE CURRENT DATA
+    # ========================================================
+    #
+    # This happens immediately.
+    #
+    # No Supabase request.
+    # No email request.
+    # No database request.
     # ========================================================
 
     with current_data_lock:
 
-        current_data["temperature"] = temp
-        current_data["humidity"] = hum
-        current_data["motion"] = motion
-        current_data["sound"] = sound
-        current_data["wetness"] = wetness
-        current_data["last_update"] = timestamp
+        current_data[
+            "temperature"
+        ] = temp
+
+        current_data[
+            "humidity"
+        ] = hum
+
+        current_data[
+            "motion"
+        ] = motion
+
+        current_data[
+            "sound"
+        ] = sound
+
+        current_data[
+            "wetness"
+        ] = wetness
+
+        current_data[
+            "last_update"
+        ] = datetime.now().isoformat()
 
 
-        socket_data = dict(
+        data_for_socket = dict(
             current_data
         )
 
 
     # ========================================================
-    # SOCKET.IO
+    # SEND LIVE SENSOR UPDATE
     # ========================================================
 
     try:
 
         socketio.emit(
             "sensor_update",
-            socket_data
+            data_for_socket
         )
 
-    except Exception:
-        pass
+    except Exception as e:
+
+        log.debug(
+            "Sensor socket emit failed: %s",
+            e
+        )
 
 
     # ========================================================
-    # BACKGROUND PROCESSING
+    # QUEUE PROCESSING
     # ========================================================
 
     item = (
+
         temp,
+
         hum,
+
         motion,
+
         sound,
+
         wetness
     )
 
@@ -1542,9 +1673,8 @@ def api_ingest():
             item
         )
 
-    except queue.Full:
 
-        # Remove oldest item.
+    except queue.Full:
 
         try:
 
@@ -1553,6 +1683,7 @@ def api_ingest():
             reading_queue.task_done()
 
         except queue.Empty:
+
             pass
 
 
@@ -1563,7 +1694,11 @@ def api_ingest():
             )
 
         except queue.Full:
-            pass
+
+            log.warning(
+                "Sensor queue full - "
+                "dropping reading"
+            )
 
 
     # ========================================================
@@ -1571,12 +1706,16 @@ def api_ingest():
     # ========================================================
 
     return jsonify({
-        "status": "ok",
+
+        "status":
+            "ok",
+
         "abnormal":
             check_abnormal(
                 temp,
                 hum
             )
+
     })
 
 
@@ -1593,35 +1732,39 @@ def api_upload_frame():
     global latest_frame
 
 
-    data = request.get_data(
-        cache=False
-    )
+    data = request.get_data()
 
 
     if (
+
         not data
+
         or
+
         len(data) < 100
+
     ):
 
         return jsonify({
+
             "error":
                 "Empty or invalid frame"
+
         }), 400
 
 
-    # --------------------------------------------------------
-    # Replace old frame immediately.
-    # --------------------------------------------------------
+    # ========================================================
+    # REPLACE OLD FRAME
+    # ========================================================
 
     with _frame_lock:
 
         latest_frame = data
 
 
-    # --------------------------------------------------------
-    # Broadcast only newest frame.
-    # --------------------------------------------------------
+    # ========================================================
+    # BROADCAST NEWEST FRAME
+    # ========================================================
 
     _broadcast_frame(
         data
@@ -1629,12 +1772,15 @@ def api_upload_frame():
 
 
     return jsonify({
-        "status": "ok"
+
+        "status":
+            "ok"
+
     })
 
 
 # ============================================================
-# VIDEO STREAM
+# VIDEO FEED
 # ============================================================
 
 @app.route(
@@ -1644,9 +1790,9 @@ def video_feed():
 
     def generate():
 
-        # ----------------------------------------------------
-        # One frame maximum.
-        # ----------------------------------------------------
+        # ====================================================
+        # ONE FRAME BUFFER ONLY
+        # ====================================================
 
         q = queue.Queue(
             maxsize=1
@@ -1662,9 +1808,9 @@ def video_feed():
 
         try:
 
-            # ------------------------------------------------
-            # Send current frame immediately.
-            # ------------------------------------------------
+            # =================================================
+            # SEND CURRENT FRAME
+            # =================================================
 
             with _frame_lock:
 
@@ -1674,22 +1820,30 @@ def video_feed():
             if frame is not None:
 
                 yield (
+
                     b"--frame\r\n"
+
                     b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-cache, "
-                    b"no-store, must-revalidate\r\n"
+
+                    b"Cache-Control: no-cache\r\n"
+
                     b"Pragma: no-cache\r\n"
+
                     b"\r\n"
+
                     +
+
                     frame
+
                     +
+
                     b"\r\n"
                 )
 
 
-            # ------------------------------------------------
-            # Continue with newest frames.
-            # ------------------------------------------------
+            # =================================================
+            # WAIT FOR NEW FRAMES
+            # =================================================
 
             while True:
 
@@ -1697,15 +1851,23 @@ def video_feed():
 
 
                 yield (
+
                     b"--frame\r\n"
+
                     b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-cache, "
-                    b"no-store, must-revalidate\r\n"
+
+                    b"Cache-Control: no-cache\r\n"
+
                     b"Pragma: no-cache\r\n"
+
                     b"\r\n"
+
                     +
+
                     frame
+
                     +
+
                     b"\r\n"
                 )
 
@@ -1727,26 +1889,23 @@ def video_feed():
 
             with _subscribers_lock:
 
-                try:
+                if q in _frame_subscribers:
 
                     _frame_subscribers.remove(
                         q
                     )
 
-                except ValueError:
-
-                    pass
-
 
     return Response(
+
         generate(),
 
-        mimetype=(
-            "multipart/x-mixed-replace;"
-            " boundary=frame"
-        ),
+        mimetype=
+            "multipart/x-mixed-replace; "
+            "boundary=frame",
 
         headers={
+
             "Cache-Control":
                 "no-cache, no-store, "
                 "must-revalidate",
@@ -1758,10 +1917,7 @@ def video_feed():
                 "0",
 
             "X-Accel-Buffering":
-                "no",
-
-            "Connection":
-                "keep-alive"
+                "no"
         }
     )
 
@@ -1782,8 +1938,13 @@ def api_chat():
 
 
     msg = (
-        data.get("message")
+
+        data.get(
+            "message"
+        )
+
         or ""
+
     ).lower().strip()
 
 
@@ -1795,15 +1956,29 @@ def api_chat():
 
 
     temp = (
-        d.get("temperature")
-        if d.get("temperature") is not None
+
+        d.get(
+            "temperature"
+        )
+
+        if d.get(
+            "temperature"
+        ) is not None
+
         else "--"
     )
 
 
     hum = (
-        d.get("humidity")
-        if d.get("humidity") is not None
+
+        d.get(
+            "humidity"
+        )
+
+        if d.get(
+            "humidity"
+        ) is not None
+
         else "--"
     )
 
@@ -1830,17 +2005,29 @@ def api_chat():
 
 
     motion_str = (
+
         "moving"
-        if d.get("motion")
+
+        if d.get(
+            "motion"
+        )
+
         else
+
         "quiet/sleeping"
     )
 
 
     diaper_str = (
-        "wet — needs changing"
-        if d.get("wetness")
+
+        "wet - needs changing"
+
+        if d.get(
+            "wetness"
+        )
+
         else
+
         "dry"
     )
 
@@ -1850,19 +2037,23 @@ def api_chat():
     # ========================================================
 
     if any(
+
         word in msg
+
         for word in [
             "temp",
             "hot",
             "cold",
             "warm"
         ]
+
     ):
 
         reply = (
+
             f"The current temperature is "
             f"{temp}°C. Safe range is "
-            f"{tmin}–{tmax}°C."
+            f"{tmin}-{tmax}°C."
         )
 
 
@@ -1871,13 +2062,13 @@ def api_chat():
             if temp < float(tmin):
 
                 reply += (
-                    " It's **below** the minimum."
+                    " It is below the minimum."
                 )
 
             elif temp > float(tmax):
 
                 reply += (
-                    " It's **above** the maximum."
+                    " It is above the maximum."
                 )
 
             else:
@@ -1892,17 +2083,21 @@ def api_chat():
     # ========================================================
 
     elif any(
+
         word in msg
+
         for word in [
             "humid",
             "moist"
         ]
+
     ):
 
         reply = (
+
             f"The current humidity is "
             f"{hum}%. Safe range is "
-            f"{hmin}–{hmax}%."
+            f"{hmin}-{hmax}%."
         )
 
 
@@ -1911,13 +2106,13 @@ def api_chat():
             if hum < float(hmin):
 
                 reply += (
-                    " It's **below** the minimum."
+                    " It is below the minimum."
                 )
 
             elif hum > float(hmax):
 
                 reply += (
-                    " It's **above** the maximum."
+                    " It is above the maximum."
                 )
 
             else:
@@ -1932,7 +2127,9 @@ def api_chat():
     # ========================================================
 
     elif any(
+
         word in msg
+
         for word in [
             "motion",
             "move",
@@ -1940,25 +2137,14 @@ def api_chat():
             "activity",
             "active"
         ]
+
     ):
 
         reply = (
-            f"Baby is currently **"
-            f"{motion_str}**."
+
+            f"Baby is currently "
+            f"{motion_str}."
         )
-
-
-        if d.get("motion"):
-
-            reply += (
-                " Recent motion was detected."
-            )
-
-        else:
-
-            reply += (
-                " No recent motion was detected."
-            )
 
 
     # ========================================================
@@ -1966,7 +2152,9 @@ def api_chat():
     # ========================================================
 
     elif any(
+
         word in msg
+
         for word in [
             "sound",
             "noise",
@@ -1974,29 +2162,22 @@ def api_chat():
             "cry",
             "crying"
         ]
+
     ):
 
         if d.get("sound"):
 
             reply = (
                 "Sound level is currently "
-                "**loud/noisy**."
-            )
-
-            reply += (
-                " This may indicate crying "
-                "or a loud environment."
+                "loud/noisy. This may indicate "
+                "crying or a loud environment."
             )
 
         else:
 
             reply = (
-                "Sound level is currently "
-                "**quiet**."
-            )
-
-            reply += (
-                " No loud sounds detected."
+                "Sound level is currently quiet. "
+                "No loud sounds detected."
             )
 
 
@@ -2005,7 +2186,9 @@ def api_chat():
     # ========================================================
 
     elif any(
+
         word in msg
+
         for word in [
             "diaper",
             "wet",
@@ -2013,23 +2196,25 @@ def api_chat():
             "nappy",
             "change"
         ]
+
     ):
 
         reply = (
-            f"Diaper is **{diaper_str}**."
+
+            f"Diaper is {diaper_str}."
         )
 
 
         if d.get("wetness"):
 
             reply += (
-                " It's time for a change!"
+                " It is time for a change!"
             )
 
         else:
 
             reply += (
-                " All good, no change needed."
+                " No change needed."
             )
 
 
@@ -2038,20 +2223,24 @@ def api_chat():
     # ========================================================
 
     elif any(
+
         word in msg
+
         for word in [
             "hi",
             "hello",
             "hey",
             "help"
         ]
+
     ):
 
         reply = (
-            "Hello! I'm your Baby Cradle "
+
+            "Hello! I am your Baby Cradle "
             "Monitoring assistant. Ask about "
-            "**temperature**, **humidity**, "
-            "**motion**, **sound**, or **diaper**."
+            "temperature, humidity, motion, "
+            "sound, or diaper."
         )
 
 
@@ -2060,13 +2249,16 @@ def api_chat():
     # ========================================================
 
     elif any(
+
         word in msg
+
         for word in [
             "status",
             "summary",
             "all",
             "overview"
         ]
+
     ):
 
         flags = []
@@ -2087,6 +2279,7 @@ def api_chat():
 
 
         if check_abnormal(
+
             temp
             if temp != "--"
             else None,
@@ -2094,28 +2287,36 @@ def api_chat():
             hum
             if hum != "--"
             else None
+
         ):
 
             flags.append(
-                "⚠️ abnormal readings"
+                "abnormal readings"
             )
 
 
         reply = (
-            f"**Temperature:** {temp}°C  |  "
-            f"**Humidity:** {hum}%  |  "
-            f"**Motion:** {motion_str}  |  "
-            f"**Sound:** "
-            f"{'loud' if d.get('sound') else 'quiet'}  |  "
-            f"**Diaper:** {diaper_str}"
+
+            f"Temperature: {temp}°C | "
+            f"Humidity: {hum}% | "
+            f"Motion: {motion_str} | "
+            f"Sound: "
+            f"{'loud' if d.get('sound') else 'quiet'} | "
+            f"Diaper: {diaper_str}"
         )
 
 
         if flags:
 
             reply += (
-                f"\n\nNotable: "
-                f"{' · '.join(flags)}"
+
+                "\n\nNotable: "
+
+                +
+
+                " · ".join(
+                    flags
+                )
             )
 
 
@@ -2126,28 +2327,34 @@ def api_chat():
     else:
 
         reply = (
-            "I can answer about: "
-            "**temperature**, **humidity**, "
-            "**motion**, **sound**, **diaper**, "
-            "or say **status** for a full summary."
+
+            "I can answer about temperature, "
+            "humidity, motion, sound, diaper, "
+            "or status."
         )
 
 
     return jsonify({
-        "reply": reply
+
+        "reply":
+            reply
+
     })
 
 
 # ============================================================
-# HEALTH
+# HEALTH CHECK
 # ============================================================
 
-@app.route("/health")
+@app.route(
+    "/health"
+)
 def health():
 
     return jsonify({
 
-        "status": "healthy",
+        "status":
+            "healthy",
 
         "database":
             supabase is not None,
@@ -2156,22 +2363,19 @@ def health():
             reading_queue.qsize(),
 
         "database_queue":
-            db_queue.qsize(),
-
-        "alert_queue":
-            alert_queue.qsize(),
+            database_queue.qsize(),
 
         "email_queue":
             email_queue.qsize(),
 
-        "video_clients":
-            len(_frame_subscribers)
+        "timestamp":
+            datetime.now().isoformat()
 
     })
 
 
 # ============================================================
-# RUN LOCALLY
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
@@ -2184,9 +2388,9 @@ if __name__ == "__main__":
     )
 
 
-    log.warning(
+    log.info(
         "Baby Cradle Monitoring Server "
-        "starting on port %s",
+        "starting on port %s...",
         port
     )
 
@@ -2202,5 +2406,4 @@ if __name__ == "__main__":
         debug=False,
 
         allow_unsafe_werkzeug=True
-
     )
