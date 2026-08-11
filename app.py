@@ -7,6 +7,7 @@ import queue
 import threading
 import logging
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -15,9 +16,9 @@ from flask_socketio import SocketIO
 from dotenv import load_dotenv
 
 
-# ============================================================================
+# ============================================================
 # LOGGING
-# ============================================================================
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,16 +29,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ============================================================================
+# ============================================================
 # ENVIRONMENT
-# ============================================================================
+# ============================================================
 
 load_dotenv()
 
 
-# ============================================================================
-# FLASK / SOCKET.IO
-# ============================================================================
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
 
@@ -46,9 +47,6 @@ app.config["SECRET_KEY"] = os.getenv(
     "baby-monitor-secret-key"
 )
 
-# Explicit threading mode.
-# This works better with Gunicorn gthread than trying to use
-# eventlet/gevent unnecessarily.
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -56,9 +54,9 @@ socketio = SocketIO(
 )
 
 
-# ============================================================================
+# ============================================================
 # SUPABASE
-# ============================================================================
+# ============================================================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -87,38 +85,13 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 else:
     log.warning(
-        "SUPABASE_URL / SUPABASE_KEY not set. "
-        "Running without database."
+        "SUPABASE_URL / SUPABASE_KEY not set"
     )
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# How often sensor readings should be written to Supabase.
-#
-# The Raspberry Pi can send data much faster than this.
-# The dashboard still receives every reading immediately.
-#
-# Set to 1 for one database write per second.
-# Set to 2 for one database write every two seconds, etc.
-DB_SAVE_INTERVAL = float(
-    os.getenv("DB_SAVE_INTERVAL", "1.0")
-)
-
-# How long the same alert type must wait before another email.
-ALERT_COOLDOWN = int(
-    os.getenv("ALERT_COOLDOWN", "300")
-)
-
-# Camera frame queue size.
-FRAME_QUEUE_SIZE = 1
-
-
-# ============================================================================
-# CURRENT SENSOR STATE
-# ============================================================================
+# ============================================================
+# CURRENT SENSOR DATA
+# ============================================================
 
 current_data = {
     "temperature": 0,
@@ -129,139 +102,12 @@ current_data = {
     "last_update": None,
 }
 
-_current_data_lock = threading.Lock()
+_data_lock = threading.Lock()
 
 
-# ============================================================================
-# SENSOR DATABASE QUEUE
-# ============================================================================
-
-# Only a small number of sensor readings are allowed to wait.
-#
-# This prevents the server from creating thousands of threads when
-# the Raspberry Pi sends data rapidly.
-sensor_queue = queue.Queue(maxsize=5)
-
-
-def enqueue_sensor_reading(reading):
-    """
-    Put a reading into the DB queue.
-
-    If the queue is full, discard an old reading and keep
-    the newest one.
-    """
-
-    try:
-        sensor_queue.put_nowait(reading)
-        return True
-
-    except queue.Full:
-
-        try:
-            sensor_queue.get_nowait()
-        except queue.Empty:
-            pass
-
-        try:
-            sensor_queue.put_nowait(reading)
-            return True
-        except queue.Full:
-            return False
-
-
-# ============================================================================
-# DATABASE WORKER
-# ============================================================================
-
-_last_db_save_time = 0.0
-_db_save_lock = threading.Lock()
-
-
-def database_worker():
-    """
-    Single background worker responsible for Supabase writes.
-
-    This is deliberately ONE worker instead of creating a new
-    thread for every /api/ingest request.
-    """
-
-    global _last_db_save_time
-
-    log.info("Database worker started")
-
-    while True:
-
-        try:
-            reading = sensor_queue.get()
-
-            if reading is None:
-                sensor_queue.task_done()
-                continue
-
-            # ---------------------------------------------------------------
-            # Rate limit database writes
-            # ---------------------------------------------------------------
-
-            now = time.monotonic()
-
-            wait_time = (
-                DB_SAVE_INTERVAL
-                - (now - _last_db_save_time)
-            )
-
-            if wait_time > 0:
-                time.sleep(wait_time)
-
-            # ---------------------------------------------------------------
-            # Save to Supabase
-            # ---------------------------------------------------------------
-
-            if supabase is not None:
-
-                try:
-
-                    supabase.table(
-                        "sensor_readings"
-                    ).insert(reading).execute()
-
-                    _last_db_save_time = time.monotonic()
-
-                    log.info(
-                        "Sensor reading saved to Supabase"
-                    )
-
-                except Exception as e:
-
-                    log.error(
-                        "Supabase sensor insert error: %s",
-                        e
-                    )
-
-            sensor_queue.task_done()
-
-        except Exception as e:
-
-            log.exception(
-                "Database worker error: %s",
-                e
-            )
-
-            time.sleep(1)
-
-
-# Start exactly ONE database worker.
-_db_worker = threading.Thread(
-    target=database_worker,
-    name="supabase-db-worker",
-    daemon=True
-)
-
-_db_worker.start()
-
-
-# ============================================================================
-# CAMERA FRAME MANAGEMENT
-# ============================================================================
+# ============================================================
+# VIDEO FRAME STORAGE
+# ============================================================
 
 latest_frame = None
 
@@ -276,8 +122,8 @@ def _broadcast_frame(frame):
     """
     Send the newest frame to all connected browsers.
 
-    Each browser has a queue of size 1, meaning old frames
-    are discarded instead of building a backlog.
+    Each browser has a queue of size 1.
+    Old frames are discarded if the browser is slow.
     """
 
     with _subscribers_lock:
@@ -287,33 +133,58 @@ def _broadcast_frame(frame):
         for q in _frame_subscribers:
 
             try:
+
+                # If queue is full, remove old frame.
+                if q.full():
+
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+
                 q.put_nowait(frame)
 
-            except queue.Full:
-
-                # Drop stale frame.
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    pass
-
-                try:
-                    q.put_nowait(frame)
-                except queue.Full:
-                    pass
-
             except Exception:
+
                 dead_subscribers.append(q)
 
         for q in dead_subscribers:
 
-            if q in _frame_subscribers:
+            try:
                 _frame_subscribers.remove(q)
+            except ValueError:
+                pass
 
 
-# ============================================================================
-# EMAIL ALERT SYSTEM
-# ============================================================================
+# ============================================================
+# CONTROLLED BACKGROUND WORKERS
+# ============================================================
+
+# IMPORTANT:
+# Do NOT create unlimited threads for every sensor request.
+#
+# The old implementation did:
+#
+# threading.Thread(...).start()
+#
+# on every /api/ingest request.
+#
+# With frequent Raspberry Pi readings this can exhaust
+# resources on a small Render instance.
+
+MAX_BACKGROUND_WORKERS = int(
+    os.getenv("MAX_BACKGROUND_WORKERS", "2")
+)
+
+executor = ThreadPoolExecutor(
+    max_workers=MAX_BACKGROUND_WORKERS,
+    thread_name_prefix="sensor-worker"
+)
+
+
+# ============================================================
+# ALERT CONFIGURATION
+# ============================================================
 
 BIRD_API_KEY = os.getenv("BIRD_API_KEY", "")
 
@@ -328,17 +199,35 @@ ALERT_EMAIL = os.getenv(
 )
 
 
-# Per-alert cooldown.
-_last_alert_email = {}
+# Email cooldown.
+EMAIL_COOLDOWN = int(
+    os.getenv("EMAIL_COOLDOWN", "300")
+)
 
-_alert_email_lock = threading.Lock()
+_last_email_ts = 0
 
+_email_lock = threading.Lock()
+
+
+# Database alert cooldown.
+#
+# Prevents the same abnormal condition from creating
+# hundreds of rows per minute.
+
+ALERT_DB_COOLDOWN = int(
+    os.getenv("ALERT_DB_COOLDOWN", "60")
+)
+
+_last_alert_ts = {}
+
+_alert_lock = threading.Lock()
+
+
+# ============================================================
+# BIRD EMAIL
+# ============================================================
 
 def bird_host():
-
-    """
-    Derive Bird platform host from the API key region.
-    """
 
     parts = BIRD_API_KEY.split("_")
 
@@ -352,16 +241,13 @@ def bird_host():
 
 
 def send_alert_email(alerts):
-    """
-    Send alert email.
 
-    Uses a global cooldown to prevent email flooding.
-    """
+    global _last_email_ts
 
     if not BIRD_API_KEY:
 
         log.warning(
-            "BIRD_API_KEY not set - skipping email."
+            "BIRD_API_KEY not set - email disabled"
         )
 
         return False
@@ -369,54 +255,29 @@ def send_alert_email(alerts):
     if not ALERT_EMAIL:
 
         log.warning(
-            "ALERT_EMAIL not set - skipping email."
+            "ALERT_EMAIL not set - email disabled"
         )
 
         return False
 
-    if not alerts:
-        return False
-
     now = time.time()
 
-    # Determine alert types.
-    alert_types = set(
-        a.get("alert_type")
-        for a in alerts
-    )
+    # Thread-safe email cooldown
+    with _email_lock:
 
-    # ---------------------------------------------------------------
-    # Check cooldown
-    # ---------------------------------------------------------------
+        if now - _last_email_ts < EMAIL_COOLDOWN:
 
-    with _alert_email_lock:
-
-        allowed = False
-
-        for alert_type in alert_types:
-
-            last_time = _last_alert_email.get(
-                alert_type,
-                0
-            )
-
-            if now - last_time >= ALERT_COOLDOWN:
-                allowed = True
-                break
-
-        if not allowed:
             return False
 
-        for alert_type in alert_types:
-            _last_alert_email[alert_type] = now
+        # Reserve cooldown immediately.
+        # This prevents several worker threads from
+        # simultaneously sending the same email.
 
-    # ---------------------------------------------------------------
-    # Email content
-    # ---------------------------------------------------------------
+        _last_email_ts = now
 
     items = "".join(
-        f"<li><b>{a['severity'].upper()}</b> "
-        f"— {a['message']}</li>"
+        f"<li><b>{a['severity'].upper()}</b> - "
+        f"{a['message']}</li>"
         for a in alerts
     )
 
@@ -424,31 +285,31 @@ def send_alert_email(alerts):
         "%Y-%m-%d %H:%M:%S"
     )
 
-    subject = "🚼 Baby Monitoring Alert"
+    subject = "Baby Monitoring Alert"
 
     if any(
         a["alert_type"] == "crying"
         for a in alerts
     ):
-        subject = "👶 Baby Crying Detected"
+        subject = "Baby Crying Detected"
 
     elif any(
         a["alert_type"] == "wetness"
         for a in alerts
     ):
-        subject = "💧 Wet Diaper Detected"
+        subject = "Wet Diaper Detected"
 
     elif any(
         a["alert_type"] == "temperature"
         for a in alerts
     ):
-        subject = "🌡️ Temperature Alert"
+        subject = "Temperature Alert"
 
     elif any(
         a["alert_type"] == "humidity"
         for a in alerts
     ):
-        subject = "💦 Humidity Alert"
+        subject = "Humidity Alert"
 
     payload = {
 
@@ -461,18 +322,17 @@ def send_alert_email(alerts):
         "subject": subject,
 
         "html": (
-            "<h2>🚼 Baby Cradle Alert</h2>"
+            "<h2>Baby Cradle Alert</h2>"
 
             f"<p>Detected {len(alerts)} "
-            f"issue(s) at <b>{timestamp}</b>:</p>"
+            f"issue(s) at "
+            f"<b>{timestamp}</b>:</p>"
 
             f"<ul>{items}</ul>"
 
-            "<p>Live dashboard:</p>"
-
-            "<a href='https://baby-monitoring-system-7.onrender.com'>"
-            "Open Baby Monitoring Dashboard"
-            "</a>"
+            "<p>Open the Baby Monitoring "
+            "dashboard to view the current "
+            "status.</p>"
         )
     }
 
@@ -492,7 +352,7 @@ def send_alert_email(alerts):
 
             json=payload,
 
-            timeout=15
+            timeout=10
         )
 
         if response.status_code in (200, 202):
@@ -506,9 +366,9 @@ def send_alert_email(alerts):
             return True
 
         log.error(
-            "Bird email failed %s: %s",
+            "Bird email failed: %s %s",
             response.status_code,
-            response.text[:300]
+            response.text[:200]
         )
 
     except Exception as e:
@@ -521,11 +381,11 @@ def send_alert_email(alerts):
     return False
 
 
-# ============================================================================
-# SENSOR LIMIT CHECKS
-# ============================================================================
+# ============================================================
+# THRESHOLDS
+# ============================================================
 
-def check_abnormal(temp, hum):
+def get_thresholds():
 
     temp_min = float(
         os.getenv("TEMP_MIN", "20")
@@ -535,26 +395,59 @@ def check_abnormal(temp, hum):
         os.getenv("TEMP_MAX", "25")
     )
 
-    hum_min = float(
+    humidity_min = float(
         os.getenv("HUMIDITY_MIN", "40")
     )
 
-    hum_max = float(
+    humidity_max = float(
         os.getenv("HUMIDITY_MAX", "60")
     )
 
+    return (
+        temp_min,
+        temp_max,
+        humidity_min,
+        humidity_max
+    )
+
+
+# ============================================================
+# ABNORMAL CHECK
+# ============================================================
+
+def check_abnormal(temp, hum):
+
+    (
+        temp_min,
+        temp_max,
+        hum_min,
+        hum_max
+    ) = get_thresholds()
+
     if temp is not None:
 
-        if temp < temp_min or temp > temp_max:
+        if (
+            temp < temp_min
+            or
+            temp > temp_max
+        ):
             return True
 
     if hum is not None:
 
-        if hum < hum_min or hum > hum_max:
+        if (
+            hum < hum_min
+            or
+            hum > hum_max
+        ):
             return True
 
     return False
 
+
+# ============================================================
+# ALERT GENERATION
+# ============================================================
 
 def check_alerts(
     temp,
@@ -563,27 +456,18 @@ def check_alerts(
     sound
 ):
 
-    temp_min = float(
-        os.getenv("TEMP_MIN", "20")
-    )
-
-    temp_max = float(
-        os.getenv("TEMP_MAX", "25")
-    )
-
-    hum_min = float(
-        os.getenv("HUMIDITY_MIN", "40")
-    )
-
-    hum_max = float(
-        os.getenv("HUMIDITY_MAX", "60")
-    )
+    (
+        temp_min,
+        temp_max,
+        hum_min,
+        hum_max
+    ) = get_thresholds()
 
     alerts = []
 
-    # ---------------------------------------------------------------
-    # Temperature
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # TEMPERATURE
+    # --------------------------------------------------------
 
     if temp is not None:
 
@@ -591,29 +475,35 @@ def check_alerts(
 
             alerts.append({
 
-                "alert_type": "temperature",
+                "alert_type":
+                    "temperature",
 
-                "severity": "critical",
+                "severity":
+                    "critical",
 
                 "message":
-                    f"⚠️ Temperature too low: {temp}°C"
+                    f"Temperature too low: "
+                    f"{temp}°C"
             })
 
         elif temp > temp_max:
 
             alerts.append({
 
-                "alert_type": "temperature",
+                "alert_type":
+                    "temperature",
 
-                "severity": "critical",
+                "severity":
+                    "critical",
 
                 "message":
-                    f"⚠️ Temperature too high: {temp}°C"
+                    f"Temperature too high: "
+                    f"{temp}°C"
             })
 
-    # ---------------------------------------------------------------
-    # Humidity
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # HUMIDITY
+    # --------------------------------------------------------
 
     if hum is not None:
 
@@ -621,128 +511,234 @@ def check_alerts(
 
             alerts.append({
 
-                "alert_type": "humidity",
+                "alert_type":
+                    "humidity",
 
-                "severity": "warning",
+                "severity":
+                    "warning",
 
                 "message":
-                    f"💧 Humidity too low: {hum}%"
+                    f"Humidity too low: "
+                    f"{hum}%"
             })
 
         elif hum > hum_max:
 
             alerts.append({
 
-                "alert_type": "humidity",
+                "alert_type":
+                    "humidity",
 
-                "severity": "warning",
+                "severity":
+                    "warning",
 
                 "message":
-                    f"💧 Humidity too high: {hum}%"
+                    f"Humidity too high: "
+                    f"{hum}%"
             })
 
-    # ---------------------------------------------------------------
-    # Wetness
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # WETNESS
+    # --------------------------------------------------------
 
     if wetness:
 
         alerts.append({
 
-            "alert_type": "wetness",
+            "alert_type":
+                "wetness",
 
-            "severity": "critical",
+            "severity":
+                "critical",
 
             "message":
-                "🚼 Diaper is wet! Please change the diaper."
+                "Diaper is wet! "
+                "Please change the diaper."
         })
 
-    # ---------------------------------------------------------------
-    # Sound
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # SOUND
+    # --------------------------------------------------------
 
     if sound:
 
         alerts.append({
 
-            "alert_type": "crying",
+            "alert_type":
+                "crying",
 
-            "severity": "critical",
+            "severity":
+                "critical",
 
             "message":
-                "👶 Baby is crying!"
+                "Baby is crying!"
         })
 
+    return alerts
+
+
+# ============================================================
+# ALERT DATABASE INSERT
+# ============================================================
+
+def save_alerts(alerts):
+
     if not alerts:
+
         return
 
-    # ---------------------------------------------------------------
-    # Save alerts
-    # ---------------------------------------------------------------
+    if supabase is None:
+
+        return
+
+    now = time.time()
+
+    for alert in alerts:
+
+        alert_type = alert["alert_type"]
+
+        # Prevent repeated inserts of the exact same
+        # alert every time the Pi sends sensor data.
+
+        with _alert_lock:
+
+            previous = _last_alert_ts.get(
+                alert_type,
+                0
+            )
+
+            if (
+                now - previous
+                < ALERT_DB_COOLDOWN
+            ):
+                continue
+
+            _last_alert_ts[
+                alert_type
+            ] = now
+
+        try:
+
+            supabase.table(
+                "alerts"
+            ).insert({
+
+                "alert_type":
+                    alert["alert_type"],
+
+                "severity":
+                    alert["severity"],
+
+                "message":
+                    alert["message"]
+
+            }).execute()
+
+            # Notify browser immediately.
+
+            socketio.emit(
+                "new_alert",
+                alert
+            )
+
+            log.info(
+                "NEW ALERT: %s",
+                alert["message"]
+            )
+
+        except Exception as e:
+
+            log.error(
+                "Supabase alert insert error: %s",
+                e
+            )
+
+
+# ============================================================
+# PROCESS SENSOR READING
+# ============================================================
+
+def _process_reading(
+    temp,
+    hum,
+    motion,
+    sound,
+    wetness
+):
+
+    # --------------------------------------------------------
+    # SAVE SENSOR DATA
+    # --------------------------------------------------------
 
     if supabase is not None:
 
-        for alert in alerts:
+        reading = {
 
-            try:
+            "temperature":
+                temp,
 
-                supabase.table(
-                    "alerts"
-                ).insert(alert).execute()
+            "humidity":
+                hum,
 
-                socketio.emit(
-                    "new_alert",
-                    alert
+            "motion_detected":
+                motion,
+
+            "sound_level":
+                sound,
+
+            "wetness_detected":
+                wetness,
+
+            "is_abnormal":
+                check_abnormal(
+                    temp,
+                    hum
                 )
+        }
 
-                log.info(
-                    "NEW ALERT: %s",
-                    alert["message"]
-                )
+        try:
 
-            except Exception as e:
+            supabase.table(
+                "sensor_readings"
+            ).insert(
+                reading
+            ).execute()
 
-                log.error(
-                    "Supabase alert insert error: %s",
-                    e
-                )
+            log.info(
+                "Sensor reading saved to Supabase"
+            )
 
-    # ---------------------------------------------------------------
-    # Email
-    # ---------------------------------------------------------------
+        except Exception as e:
 
-    send_alert_email(alerts)
+            log.error(
+                "Sensor DB insert error: %s",
+                e
+            )
 
+    # --------------------------------------------------------
+    # ALERTS
+    # --------------------------------------------------------
 
-# ============================================================================
-# PROCESS SENSOR DATA
-# ============================================================================
-
-def process_sensor_reading(reading):
-
-    """
-    Process alert conditions.
-
-    Database insertion is handled by the single database worker.
-    """
-
-    temp = reading.get("temperature")
-    hum = reading.get("humidity")
-    motion = reading.get("motion_detected", False)
-    sound = reading.get("sound_level", 0)
-    wetness = reading.get("wetness_detected", False)
-
-    check_alerts(
+    alerts = check_alerts(
         temp,
         hum,
         wetness,
         sound
     )
 
+    if alerts:
 
-# ============================================================================
+        save_alerts(alerts)
+
+        # Email is handled after database processing.
+        # Email has its own global cooldown.
+
+        send_alert_email(alerts)
+
+
+# ============================================================
 # FLASK ROUTES
-# ============================================================================
+# ============================================================
 
 @app.route("/")
 def index():
@@ -768,23 +764,25 @@ def history():
     )
 
 
-# ============================================================================
+# ============================================================
 # CURRENT DATA
-# ============================================================================
+# ============================================================
 
 @app.route("/api/current_data")
 def api_current_data():
 
-    with _current_data_lock:
+    with _data_lock:
 
-        return jsonify(
-            dict(current_data)
+        data = dict(
+            current_data
         )
 
+    return jsonify(data)
 
-# ============================================================================
+
+# ============================================================
 # HISTORY
-# ============================================================================
+# ============================================================
 
 @app.route("/api/history")
 def api_history():
@@ -799,10 +797,11 @@ def api_history():
         type=int
     )
 
-    # Prevent accidentally requesting thousands of rows.
+    # Protect the database from huge requests.
+
     limit = max(
         1,
-        min(limit, 200)
+        min(limit, 100)
     )
 
     try:
@@ -810,18 +809,13 @@ def api_history():
         response = (
 
             supabase
-
             .table("sensor_readings")
-
             .select("*")
-
             .order(
                 "created_at",
                 desc=True
             )
-
             .limit(limit)
-
             .execute()
         )
 
@@ -837,13 +831,14 @@ def api_history():
         )
 
         return jsonify({
-            "error": str(e)
+            "error":
+                "Unable to load history"
         }), 500
 
 
-# ============================================================================
-# ALERTS
-# ============================================================================
+# ============================================================
+# ALERT HISTORY
+# ============================================================
 
 @app.route("/api/alerts")
 def api_alerts():
@@ -860,7 +855,7 @@ def api_alerts():
 
     limit = max(
         1,
-        min(limit, 100)
+        min(limit, 50)
     )
 
     try:
@@ -868,18 +863,13 @@ def api_alerts():
         response = (
 
             supabase
-
             .table("alerts")
-
             .select("*")
-
             .order(
                 "created_at",
                 desc=True
             )
-
             .limit(limit)
-
             .execute()
         )
 
@@ -895,13 +885,14 @@ def api_alerts():
         )
 
         return jsonify({
-            "error": str(e)
+            "error":
+                "Unable to load alerts"
         }), 500
 
 
-# ============================================================================
+# ============================================================
 # CLEAR ALERTS
-# ============================================================================
+# ============================================================
 
 @app.route(
     "/api/clear_alerts",
@@ -919,18 +910,14 @@ def clear_alerts():
 
         (
             supabase
-
             .table("alerts")
-
             .update({
                 "is_read": True
             })
-
             .neq(
                 "is_read",
                 True
             )
-
             .execute()
         )
 
@@ -946,13 +933,14 @@ def clear_alerts():
         )
 
         return jsonify({
-            "error": str(e)
+            "error":
+                "Unable to clear alerts"
         }), 500
 
 
-# ============================================================================
-# RASPBERRY PI SENSOR INGESTION
-# ============================================================================
+# ============================================================
+# SENSOR INGESTION
+# ============================================================
 
 @app.route(
     "/api/ingest",
@@ -971,145 +959,127 @@ def api_ingest():
     ):
 
         return jsonify({
-
             "error":
                 "Missing required fields: "
                 "temperature, humidity"
-
         }), 400
 
-    try:
+    temp = data.get(
+        "temperature"
+    )
 
-        temp = data.get(
+    hum = data.get(
+        "humidity"
+    )
+
+    motion = data.get(
+        "motion_detected",
+        False
+    )
+
+    sound = data.get(
+        "sound_level",
+        0
+    )
+
+    wetness = data.get(
+        "wetness_detected",
+        False
+    )
+
+    # --------------------------------------------------------
+    # UPDATE MEMORY
+    # --------------------------------------------------------
+
+    with _data_lock:
+
+        current_data[
             "temperature"
-        )
+        ] = temp
 
-        hum = data.get(
+        current_data[
             "humidity"
+        ] = hum
+
+        current_data[
+            "motion"
+        ] = motion
+
+        current_data[
+            "sound"
+        ] = sound
+
+        current_data[
+            "wetness"
+        ] = wetness
+
+        current_data[
+            "last_update"
+        ] = datetime.now().isoformat()
+
+        dashboard_data = dict(
+            current_data
         )
 
-        motion = data.get(
-            "motion_detected",
-            False
-        )
+    # --------------------------------------------------------
+    # UPDATE DASHBOARD
+    # --------------------------------------------------------
 
-        sound = data.get(
-            "sound_level",
-            0
-        )
-
-        wetness = data.get(
-            "wetness_detected",
-            False
-        )
-
-        # ---------------------------------------------------------------
-        # Update current state immediately.
-        # ---------------------------------------------------------------
-
-        with _current_data_lock:
-
-            current_data["temperature"] = temp
-
-            current_data["humidity"] = hum
-
-            current_data["motion"] = motion
-
-            current_data["sound"] = sound
-
-            current_data["wetness"] = wetness
-
-            current_data["last_update"] = (
-                datetime.now().isoformat()
-            )
-
-            dashboard_data = dict(
-                current_data
-            )
-
-        # ---------------------------------------------------------------
-        # Immediately update dashboards.
-        # ---------------------------------------------------------------
+    try:
 
         socketio.emit(
             "sensor_update",
             dashboard_data
         )
 
-        # ---------------------------------------------------------------
-        # Prepare DB record.
-        # ---------------------------------------------------------------
-
-        reading = {
-
-            "temperature": temp,
-
-            "humidity": hum,
-
-            "motion_detected": motion,
-
-            "sound_level": sound,
-
-            "wetness_detected": wetness,
-
-            "is_abnormal":
-                check_abnormal(
-                    temp,
-                    hum
-                )
-        }
-
-        # ---------------------------------------------------------------
-        # Queue DB write.
-        #
-        # IMPORTANT:
-        # We DO NOT create a new thread here.
-        # ---------------------------------------------------------------
-
-        enqueue_sensor_reading(
-            reading
-        )
-
-        # ---------------------------------------------------------------
-        # Alert processing.
-        #
-        # Alert processing itself is lightweight compared with
-        # database insertion. Run it using SocketIO background task
-        # rather than spawning unlimited raw threads.
-        # ---------------------------------------------------------------
-
-        socketio.start_background_task(
-            process_sensor_reading,
-            reading
-        )
-
-        return jsonify({
-
-            "status": "ok",
-
-            "abnormal":
-                check_abnormal(
-                    temp,
-                    hum
-                )
-
-        })
-
     except Exception as e:
 
-        log.exception(
-            "Ingest error: %s",
+        log.warning(
+            "Socket emit failed: %s",
             e
         )
 
-        return jsonify({
-            "error": str(e)
-        }), 500
+    # --------------------------------------------------------
+    # BACKGROUND PROCESSING
+    # --------------------------------------------------------
+
+    try:
+
+        executor.submit(
+            _process_reading,
+            temp,
+            hum,
+            motion,
+            sound,
+            wetness
+        )
+
+    except RuntimeError:
+
+        log.warning(
+            "Background worker unavailable"
+        )
+
+    # --------------------------------------------------------
+    # RETURN IMMEDIATELY
+    # --------------------------------------------------------
+
+    return jsonify({
+
+        "status":
+            "ok",
+
+        "abnormal":
+            check_abnormal(
+                temp,
+                hum
+            )
+    })
 
 
-# ============================================================================
+# ============================================================
 # CAMERA FRAME UPLOAD
-# ============================================================================
+# ============================================================
 
 @app.route(
     "/api/upload_frame",
@@ -1132,76 +1102,60 @@ def api_upload_frame():
                 "Empty or invalid frame"
         }), 400
 
-    # ---------------------------------------------------------------
-    # Replace old frame with newest frame.
-    # ---------------------------------------------------------------
+    # Store newest frame only.
 
     with _frame_lock:
 
         latest_frame = data
 
-    # ---------------------------------------------------------------
-    # Send newest frame to viewers.
-    # ---------------------------------------------------------------
+    # Broadcast immediately.
 
-    _broadcast_frame(
-        data
-    )
+    _broadcast_frame(data)
 
     return jsonify({
-        "status": "ok"
+        "status":
+            "ok"
     })
 
 
-# ============================================================================
-# LIVE VIDEO STREAM
-# ============================================================================
+# ============================================================
+# VIDEO STREAM
+# ============================================================
 
 @app.route("/video_feed")
 def video_feed():
 
     def generate():
 
-        # Each browser gets a queue containing only
-        # the newest frame.
         q = queue.Queue(
-            maxsize=FRAME_QUEUE_SIZE
+            maxsize=1
         )
 
-        # -----------------------------------------------------------
-        # Register subscriber.
-        # -----------------------------------------------------------
+        # Register browser.
 
         with _subscribers_lock:
 
-            _frame_subscribers.append(
-                q
-            )
+            _frame_subscribers.append(q)
 
         try:
 
-            # -------------------------------------------------------
-            # Send latest frame immediately if available.
-            # -------------------------------------------------------
+            # Send current frame immediately.
 
             with _frame_lock:
 
-                first_frame = latest_frame
+                frame = latest_frame
 
-            if first_frame is not None:
+            if frame is not None:
 
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-cache\r\n"
-                    b"\r\n"
-                    + first_frame
+                    b"Cache-Control: no-cache\r\n\r\n"
+                    + frame
                     + b"\r\n"
                 )
 
-            # -------------------------------------------------------
             # Continue receiving newest frames.
-            # -------------------------------------------------------
 
             while True:
 
@@ -1210,19 +1164,19 @@ def video_feed():
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-cache\r\n"
-                    b"\r\n"
+                    b"Cache-Control: no-cache\r\n\r\n"
                     + frame
                     + b"\r\n"
                 )
 
         except GeneratorExit:
+
             pass
 
         except Exception as e:
 
-            log.warning(
-                "Video stream ended: %s",
+            log.debug(
+                "Video client disconnected: %s",
                 e
             )
 
@@ -1230,11 +1184,10 @@ def video_feed():
 
             with _subscribers_lock:
 
-                if q in _frame_subscribers:
-
-                    _frame_subscribers.remove(
-                        q
-                    )
+                try:
+                    _frame_subscribers.remove(q)
+                except ValueError:
+                    pass
 
     response = Response(
 
@@ -1256,15 +1209,15 @@ def video_feed():
     ] = "no-cache"
 
     response.headers[
-        "Connection"
-    ] = "keep-alive"
+        "X-Accel-Buffering"
+    ] = "no"
 
     return response
 
 
-# ============================================================================
+# ============================================================
 # CHATBOT
-# ============================================================================
+# ============================================================
 
 @app.route(
     "/api/chat",
@@ -1281,7 +1234,7 @@ def api_chat():
         or ""
     ).lower().strip()
 
-    with _current_data_lock:
+    with _data_lock:
 
         d = dict(
             current_data
@@ -1289,13 +1242,15 @@ def api_chat():
 
     temp = (
         d.get("temperature")
-        if d.get("temperature") is not None
+        if d.get("temperature")
+        is not None
         else "--"
     )
 
     hum = (
         d.get("humidity")
-        if d.get("humidity") is not None
+        if d.get("humidity")
+        is not None
         else "--"
     )
 
@@ -1326,14 +1281,14 @@ def api_chat():
     )
 
     diaper_str = (
-        "wet — needs changing"
+        "wet - needs changing"
         if d.get("wetness")
         else "dry"
     )
 
-    # ---------------------------------------------------------------
-    # Temperature
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # TEMPERATURE
+    # --------------------------------------------------------
 
     if any(
         w in msg
@@ -1348,7 +1303,7 @@ def api_chat():
         reply = (
             f"The current temperature is "
             f"{temp}°C. Safe range is "
-            f"{tmin}–{tmax}°C."
+            f"{tmin}-{tmax}°C."
         )
 
         if temp != "--":
@@ -1356,24 +1311,27 @@ def api_chat():
             if temp < float(tmin):
 
                 reply += (
-                    " It's **below** the minimum."
+                    " It is below the "
+                    "minimum."
                 )
 
             elif temp > float(tmax):
 
                 reply += (
-                    " It's **above** the maximum."
+                    " It is above the "
+                    "maximum."
                 )
 
             else:
 
                 reply += (
-                    " This is within the normal range."
+                    " This is within "
+                    "the normal range."
                 )
 
-    # ---------------------------------------------------------------
-    # Humidity
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # HUMIDITY
+    # --------------------------------------------------------
 
     elif any(
         w in msg
@@ -1386,7 +1344,7 @@ def api_chat():
         reply = (
             f"The current humidity is "
             f"{hum}%. Safe range is "
-            f"{hmin}–{hmax}%."
+            f"{hmin}-{hmax}%."
         )
 
         if hum != "--":
@@ -1394,24 +1352,27 @@ def api_chat():
             if hum < float(hmin):
 
                 reply += (
-                    " It's **below** the minimum."
+                    " It is below "
+                    "the minimum."
                 )
 
             elif hum > float(hmax):
 
                 reply += (
-                    " It's **above** the maximum."
+                    " It is above "
+                    "the maximum."
                 )
 
             else:
 
                 reply += (
-                    " This is within the normal range."
+                    " This is within "
+                    "the normal range."
                 )
 
-    # ---------------------------------------------------------------
-    # Motion
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # MOTION
+    # --------------------------------------------------------
 
     elif any(
         w in msg
@@ -1425,19 +1386,13 @@ def api_chat():
     ):
 
         reply = (
-            f"Baby is currently **{motion_str}**."
+            f"Baby is currently "
+            f"{motion_str}."
         )
 
-        reply += (
-            " Recent motion was detected."
-            if d.get("motion")
-            else
-            " No recent motion — baby may be sleeping."
-        )
-
-    # ---------------------------------------------------------------
-    # Sound
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # SOUND
+    # --------------------------------------------------------
 
     elif any(
         w in msg
@@ -1450,24 +1405,26 @@ def api_chat():
         ]
     ):
 
-        reply = (
-            "Sound level is currently "
-            "**loud/noisy**."
-            if d.get("sound")
-            else
-            "Sound level is currently **quiet**."
-        )
+        if d.get("sound"):
 
-        reply += (
-            " This may indicate crying or a loud environment."
-            if d.get("sound")
-            else
-            " No loud sounds detected."
-        )
+            reply = (
+                "Sound level is currently "
+                "loud/noisy. This may "
+                "indicate crying or a "
+                "loud environment."
+            )
 
-    # ---------------------------------------------------------------
-    # Diaper
-    # ---------------------------------------------------------------
+        else:
+
+            reply = (
+                "Sound level is currently "
+                "quiet. No loud sound "
+                "detected."
+            )
+
+    # --------------------------------------------------------
+    # DIAPER
+    # --------------------------------------------------------
 
     elif any(
         w in msg
@@ -1481,19 +1438,24 @@ def api_chat():
     ):
 
         reply = (
-            f"Diaper is **{diaper_str}**."
+            f"Diaper is {diaper_str}."
         )
 
-        reply += (
-            " It's time for a change!"
-            if d.get("wetness")
-            else
-            " All good, no change needed."
-        )
+        if d.get("wetness"):
 
-    # ---------------------------------------------------------------
-    # Greeting
-    # ---------------------------------------------------------------
+            reply += (
+                " It is time for a change."
+            )
+
+        else:
+
+            reply += (
+                " No change needed."
+            )
+
+    # --------------------------------------------------------
+    # GREETING
+    # --------------------------------------------------------
 
     elif any(
         w in msg
@@ -1506,15 +1468,16 @@ def api_chat():
     ):
 
         reply = (
-            "Hello! I'm your Baby Cradle "
-            "Monitoring assistant. Ask about "
-            "**temperature**, **humidity**, "
-            "**motion**, **sound**, or **diaper**."
+            "Hello! I'm your Baby "
+            "Cradle Monitoring assistant. "
+            "Ask about temperature, "
+            "humidity, motion, sound, "
+            "or diaper status."
         )
 
-    # ---------------------------------------------------------------
-    # Summary
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
 
     elif any(
         w in msg
@@ -1546,38 +1509,42 @@ def api_chat():
         ):
 
             flags.append(
-                "⚠️ abnormal readings"
+                "abnormal readings"
             )
 
         reply = (
 
-            f"**Temperature:** {temp}°C  |  "
+            f"Temperature: {temp}°C\n"
 
-            f"**Humidity:** {hum}%  |  "
+            f"Humidity: {hum}%\n"
 
-            f"**Motion:** {motion_str}  |  "
+            f"Motion: {motion_str}\n"
 
-            f"**Sound:** "
-            f"{'loud' if d.get('sound') else 'quiet'}  |  "
+            f"Sound: "
+            f"{'loud' if d.get('sound') else 'quiet'}\n"
 
-            f"**Diaper:** {diaper_str}"
+            f"Diaper: {diaper_str}"
         )
 
         if flags:
 
             reply += (
-                f"\n\nNotable: "
-                f"{' · '.join(flags)}"
+                "\n\nNotable: "
+                + " - ".join(flags)
             )
+
+    # --------------------------------------------------------
+    # UNKNOWN
+    # --------------------------------------------------------
 
     else:
 
         reply = (
-            "I can answer about: "
-            "**temperature**, **humidity**, "
-            "**motion**, **sound**, **diaper**, "
-            "or say **status** for a full summary. "
-            "Type **help** for options."
+            "I can answer about "
+            "temperature, humidity, "
+            "motion, sound, or diaper "
+            "status. Type 'status' "
+            "for a full summary."
         )
 
     return jsonify({
@@ -1585,33 +1552,48 @@ def api_chat():
     })
 
 
-# ============================================================================
+# ============================================================
 # HEALTH CHECK
-# ============================================================================
+# ============================================================
 
 @app.route("/health")
 def health():
 
     return jsonify({
 
-        "status": "ok",
+        "status":
+            "healthy",
 
-        "database":
-            "connected"
-            if supabase is not None
-            else "disabled",
-
-        "queue_size":
-            sensor_queue.qsize(),
+        "supabase":
+            supabase is not None,
 
         "timestamp":
             datetime.now().isoformat()
+
     })
 
 
-# ============================================================================
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+def shutdown_executor():
+
+    try:
+
+        executor.shutdown(
+            wait=False,
+            cancel_futures=True
+        )
+
+    except Exception:
+
+        pass
+
+
+# ============================================================
 # LOCAL DEVELOPMENT
-# ============================================================================
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -1623,7 +1605,8 @@ if __name__ == "__main__":
     )
 
     debug = (
-        os.getenv("RENDER") is None
+        os.getenv("RENDER")
+        is None
     )
 
     log.info(
@@ -1632,15 +1615,21 @@ if __name__ == "__main__":
         port
     )
 
-    socketio.run(
+    try:
 
-        app,
+        socketio.run(
 
-        host="0.0.0.0",
+            app,
 
-        port=port,
+            host="0.0.0.0",
 
-        debug=debug,
+            port=port,
 
-        allow_unsafe_werkzeug=True
-    )
+            debug=debug,
+
+            allow_unsafe_werkzeug=True
+        )
+
+    finally:
+
+        shutdown_executor()
