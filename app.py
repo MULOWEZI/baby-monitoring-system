@@ -17,11 +17,9 @@ import sys
 import time
 import threading
 import logging
-import decimal
 from datetime import datetime
 
 import requests
-import psycopg2
 from flask import Flask, render_template, request, jsonify, Response
 from flask_socketio import SocketIO
 from dotenv import load_dotenv
@@ -72,68 +70,30 @@ socketio = SocketIO(
 # DATABASE
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+supabase = None
 
-
-def db_query(sql, params=()):
-    """
-    Execute a PostgreSQL query through the Supabase transaction pooler.
-
-    SELECT:
-        returns a list of dictionaries.
-
-    INSERT/UPDATE/etc:
-        returns True.
-
-    Failure:
-        returns None.
-
-    A connection is created per operation, matching the simpler
-    architecture of the faster version.
-    """
-    if not DATABASE_URL:
-        return None
-
-    conn = None
-
+if SUPABASE_URL and SUPABASE_KEY:
     try:
-        conn = psycopg2.connect(
-            DATABASE_URL,
-            connect_timeout=5,
+        from supabase import create_client
+
+        supabase = create_client(
+            SUPABASE_URL,
+            SUPABASE_KEY,
         )
-        conn.autocommit = True
 
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-
-            if cur.description:
-                columns = [col[0] for col in cur.description]
-                rows = cur.fetchall()
-
-                return [
-                    {
-                        key: (
-                            float(value)
-                            if isinstance(value, decimal.Decimal)
-                            else value
-                        )
-                        for key, value in zip(columns, row)
-                    }
-                    for row in rows
-                ]
-
-            return True
+        log.info("Supabase connected")
 
     except Exception as exc:
-        log.error("Database error: %s", exc)
-        return None
-
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        log.exception(
+            "Supabase initialization failed: %s",
+            exc,
+        )
+else:
+    log.warning(
+        "SUPABASE_URL/SUPABASE_KEY not set - database disabled"
+    )
 
 
 # ============================================================
@@ -465,21 +425,23 @@ def check_alerts(temp, hum, wetness, sound=0):
 
     # Persist alerts without delaying the sensor response.
     for alert in alerts:
-        try:
-            db_query(
-                """
-                INSERT INTO alerts
-                    (alert_type, severity, message)
-                VALUES (%s, %s, %s)
-                """,
+        if supabase is not None:
+            try:
                 (
-                    alert["alert_type"],
-                    alert["severity"],
-                    alert["message"],
-                ),
-            )
-        except Exception as exc:
-            log.error("Alert database insert failed: %s", exc)
+                    supabase
+                    .table("alerts")
+                    .insert({
+                        "alert_type": alert["alert_type"],
+                        "severity": alert["severity"],
+                        "message": alert["message"],
+                    })
+                    .execute()
+                )
+            except Exception as exc:
+                log.error(
+                    "Alert database insert failed: %s",
+                    exc,
+                )
 
     invalidate_alerts_cache()
 
@@ -557,7 +519,7 @@ def api_current_data():
 
 @app.route("/api/history")
 def api_history():
-    if not DATABASE_URL:
+    if supabase is None:
         return jsonify([])
 
     limit = request.args.get(
@@ -573,15 +535,19 @@ def api_history():
     if cached is not None:
         return jsonify(cached)
 
-    rows = db_query(
-        """
-        SELECT *
-        FROM sensor_readings
-        ORDER BY created_at DESC
-        LIMIT %s
-        """,
-        (limit,),
-    )
+    try:
+        result = (
+            supabase
+            .table("sensor_readings")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as exc:
+        log.error("History error: %s", exc)
+        rows = None
 
     if rows is None:
         return jsonify({
@@ -599,7 +565,7 @@ def api_history():
 
 @app.route("/api/alerts")
 def api_alerts():
-    if not DATABASE_URL:
+    if supabase is None:
         return jsonify([])
 
     limit = request.args.get(
@@ -615,15 +581,19 @@ def api_alerts():
     if cached is not None:
         return jsonify(cached)
 
-    rows = db_query(
-        """
-        SELECT *
-        FROM alerts
-        ORDER BY created_at DESC
-        LIMIT %s
-        """,
-        (limit,),
-    )
+    try:
+        result = (
+            supabase
+            .table("alerts")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as exc:
+        log.error("Alert history error: %s", exc)
+        rows = None
 
     if rows is None:
         return jsonify({
@@ -644,16 +614,21 @@ def api_alerts():
     methods=["POST"],
 )
 def clear_alerts():
-    if not DATABASE_URL:
+    if supabase is None:
         return jsonify({"success": True})
 
-    result = db_query(
-        """
-        UPDATE alerts
-        SET is_read = TRUE
-        WHERE is_read IS DISTINCT FROM TRUE
-        """
-    )
+    try:
+        (
+            supabase
+            .table("alerts")
+            .update({"is_read": True})
+            .neq("is_read", True)
+            .execute()
+        )
+        result = True
+    except Exception as exc:
+        log.error("Clear alerts error: %s", exc)
+        result = None
 
     if result is None:
         return jsonify({
@@ -737,28 +712,30 @@ def api_ingest():
     is_abnormal = check_abnormal(temp, hum)
 
     def persist_sensor_reading():
-        result = db_query(
-            """
-            INSERT INTO sensor_readings
-                (
-                    temperature,
-                    humidity,
-                    motion_detected,
-                    sound_level,
-                    wetness_detected,
-                    is_abnormal
-                )
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
+        if supabase is None:
+            return
+
+        try:
             (
-                temp,
-                hum,
-                motion,
-                sound,
-                wetness,
-                is_abnormal,
-            ),
-        )
+                supabase
+                .table("sensor_readings")
+                .insert({
+                    "temperature": temp,
+                    "humidity": hum,
+                    "motion_detected": motion,
+                    "sound_level": sound,
+                    "wetness_detected": wetness,
+                    "is_abnormal": is_abnormal,
+                })
+                .execute()
+            )
+            result = True
+        except Exception as exc:
+            log.error(
+                "Sensor database insert failed: %s",
+                exc,
+            )
+            result = None
 
         if result is not None:
             invalidate_history_cache()
@@ -1070,7 +1047,7 @@ def api_chat():
 def health():
     return jsonify({
         "status": "healthy",
-        "database": bool(DATABASE_URL),
+        "database": supabase is not None,
         "timestamp": datetime.now().isoformat(),
     })
 
