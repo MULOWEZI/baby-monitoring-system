@@ -48,7 +48,11 @@ app.config["SECRET_KEY"] = os.getenv(
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*"
+    cors_allowed_origins="*",
+    logger=False,
+    engineio_logger=False,
+    ping_interval=25,
+    ping_timeout=60
 )
 
 
@@ -110,29 +114,11 @@ current_data = {
     "last_update": None
 }
 
-# ============================================================
-# SENSOR BUFFERING / RATE LIMITING
-# ============================================================
-#
-# Sensor data can arrive much faster than the dashboard needs.
-# Keep the newest reading in memory and publish it every 5 seconds.
-#
-# IMPORTANT:
-# - Alert detection still runs on every incoming reading so an
-#   abnormal event is not delayed by the dashboard refresh interval.
-# - Database writes are also batched and flushed every 5 seconds
-#   to reduce Supabase traffic and Render CPU/thread overhead.
-#
-SENSOR_UPDATE_INTERVAL = float(
-    os.getenv("SENSOR_UPDATE_INTERVAL", "5")
-)
+# Browser sensor updates are limited to one update every 5 seconds.
+# Alert processing still happens for every incoming reading.
+last_sensor_socket_emit = 0.0
+sensor_emit_lock = threading.Lock()
 
-_sensor_buffer_lock = threading.Lock()
-_latest_sensor_reading = None
-
-# Alert processing is kept separate from the 5-second dashboard/DB
-# interval so abnormal conditions can still be detected immediately.
-_alert_queue = queue.Queue(maxsize=200)
 
 
 # ============================================================
@@ -150,26 +136,30 @@ _subscribers_lock = threading.Lock()
 
 def _broadcast_frame(frame):
 
-    # Latest-frame-wins buffering:
-    # never allow old camera frames to build up and create latency.
     with _subscribers_lock:
 
-        for q in list(_frame_subscribers):
+        for q in _frame_subscribers:
 
             try:
+
                 q.put_nowait(frame)
 
             except queue.Full:
 
-                # Drop the stale frame and replace it with the newest one.
                 try:
+
                     q.get_nowait()
+
                 except queue.Empty:
+
                     pass
 
                 try:
+
                     q.put_nowait(frame)
+
                 except queue.Full:
+
                     pass
 
 
@@ -480,199 +470,171 @@ def check_alerts(
     wetness,
     sound
 ):
-
     """
-    Detect NEW alert events.
+    Event-based alert system.
 
-    WETNESS:
+    Temperature:
+        normal -> abnormal = NEW ALERT
+        abnormal -> abnormal = NO NEW ALERT
+        abnormal -> normal = RESET
 
-        False -> True
-        = NEW EVENT
+    Wetness:
+        dry -> wet = NEW ALERT
+        wet -> wet = NO NEW ALERT
+        wet -> dry = RESET
 
-        True -> True
-        = NO NEW EVENT
-
-        True -> False
-        = RESET
-
-    TEMPERATURE:
-
-        Normal -> Abnormal
-        = NEW EVENT
-
-        Abnormal -> Abnormal
-        = NO NEW EVENT
-
-        Abnormal -> Normal
-        = RESET
+    Dashboard notification, Supabase storage and email are
+    independent. A database failure cannot suppress the
+    dashboard notification.
     """
 
     global previous_wetness
     global previous_temperature_abnormal
 
-
-    # ========================================================
-    # THRESHOLDS
-    # ========================================================
-
-    temp_min = float(
-        os.getenv("TEMP_MIN", 20)
-    )
-
-    temp_max = float(
-        os.getenv("TEMP_MAX", 25)
-    )
-
+    try:
+        temp_min = float(os.getenv("TEMP_MIN", "20"))
+        temp_max = float(os.getenv("TEMP_MAX", "25"))
+    except (TypeError, ValueError):
+        temp_min = 20.0
+        temp_max = 25.0
 
     alerts = []
 
+    # --------------------------------------------------------
+    # Temperature state
+    # --------------------------------------------------------
 
-    # ========================================================
-    # CURRENT TEMPERATURE STATE
-    # ========================================================
-
-    temperature_abnormal = False
-
-
-    if temp is not None:
-
-        temperature_abnormal = (
-
-            temp < temp_min
-
-            or
-
-            temp > temp_max
+    try:
+        numeric_temp = (
+            float(temp)
+            if temp is not None
+            else None
         )
+    except (TypeError, ValueError):
+        numeric_temp = None
 
-
-    # ========================================================
-    # WETNESS STATE
-    # ========================================================
-
-    current_wetness = bool(
-        wetness
+    temperature_abnormal = (
+        numeric_temp is not None
+        and (
+            numeric_temp < temp_min
+            or numeric_temp > temp_max
+        )
     )
 
+    # --------------------------------------------------------
+    # Wetness state
+    # --------------------------------------------------------
 
-    # ========================================================
-    # LOCK STATE CHANGES
-    # ========================================================
+    if isinstance(wetness, str):
+        current_wetness = (
+            wetness.strip().lower()
+            in (
+                "true",
+                "1",
+                "yes",
+                "wet",
+                "detected",
+                "on"
+            )
+        )
+    else:
+        current_wetness = bool(wetness)
+
+    # --------------------------------------------------------
+    # Detect transitions
+    # --------------------------------------------------------
 
     with alert_state_lock:
 
-
-        # ----------------------------------------------------
-        # TEMPERATURE
-        # ----------------------------------------------------
-
         new_temperature_event = (
-
             temperature_abnormal
-
-            and
-
-            not previous_temperature_abnormal
+            and not previous_temperature_abnormal
         )
 
+        new_wetness_event = (
+            current_wetness
+            and not previous_wetness
+        )
 
         if new_temperature_event:
 
-            if temp > temp_max:
-
+            if numeric_temp > temp_max:
                 message = (
                     f"🌡️ Temperature is too high: "
-                    f"{temp}°C. "
-                    f"Configured maximum is "
-                    f"{temp_max}°C."
+                    f"{numeric_temp}°C. "
+                    f"Configured maximum is {temp_max}°C."
                 )
 
-            elif temp < temp_min:
-
+            elif numeric_temp < temp_min:
                 message = (
                     f"🌡️ Temperature is too low: "
-                    f"{temp}°C. "
-                    f"Configured minimum is "
-                    f"{temp_min}°C."
+                    f"{numeric_temp}°C. "
+                    f"Configured minimum is {temp_min}°C."
                 )
 
             else:
-
                 message = (
                     f"🌡️ Abnormal temperature detected: "
-                    f"{temp}°C."
+                    f"{numeric_temp}°C."
                 )
 
-
             alerts.append({
-
                 "alert_type": "temperature",
-
                 "severity": "critical",
-
                 "message": message
             })
-
-
-        # Save current temperature state
-
-        previous_temperature_abnormal = (
-            temperature_abnormal
-        )
-
-
-        # ----------------------------------------------------
-        # WET DIAPER
-        # ----------------------------------------------------
-
-        new_wetness_event = (
-
-            current_wetness
-
-            and
-
-            not previous_wetness
-        )
-
 
         if new_wetness_event:
 
             alerts.append({
-
                 "alert_type": "wetness",
-
                 "severity": "critical",
-
-                "message":
+                "message": (
                     "💧 Diaper is wet! "
                     "Please change the diaper."
+                )
             })
 
-
-        # Save current wetness state
-
-        previous_wetness = (
-            current_wetness
+        # State is updated after the transition has been detected.
+        previous_temperature_abnormal = (
+            temperature_abnormal
         )
 
-
-    # ========================================================
-    # NO NEW EVENTS
-    # ========================================================
+        previous_wetness = current_wetness
 
     if not alerts:
+        return []
 
-        return
+    # --------------------------------------------------------
+    # DASHBOARD NOTIFICATION
+    # --------------------------------------------------------
+    # IMPORTANT: independent of Supabase.
 
+    for alert in alerts:
+        try:
+            socketio.emit(
+                "new_alert",
+                alert
+            )
 
-    # ========================================================
-    # SAVE ALERTS TO SUPABASE
-    # ========================================================
+            log.info(
+                "🔔 NEW DASHBOARD ALERT: %s",
+                alert["message"]
+            )
+
+        except Exception as e:
+            log.error(
+                "Socket.IO alert error: %s",
+                e
+            )
+
+    # --------------------------------------------------------
+    # SUPABASE
+    # --------------------------------------------------------
 
     if supabase is not None:
 
         for alert in alerts:
-
             try:
 
                 supabase.table(
@@ -681,20 +643,10 @@ def check_alerts(
                     alert
                 ).execute()
 
-
-                # Immediately update dashboard
-
-                socketio.emit(
-                    "new_alert",
-                    alert
-                )
-
-
                 log.info(
-                    "NEW ALERT: %s",
+                    "Alert saved to Supabase: %s",
                     alert["message"]
                 )
-
 
             except Exception as e:
 
@@ -703,15 +655,45 @@ def check_alerts(
                     e
                 )
 
+    else:
 
-    # ========================================================
-    # SEND ONE EMAIL FOR THE NEW EVENT
-    # ========================================================
+        log.warning(
+            "Supabase unavailable; Socket.IO alert "
+            "was still sent."
+        )
 
-    send_alert_email(
-        alerts
-    )
+    # --------------------------------------------------------
+    # ONE EMAIL FOR THIS EVENT
+    # --------------------------------------------------------
 
+    try:
+
+        email_sent = send_alert_email(
+            alerts
+        )
+
+        if email_sent:
+            log.info(
+                "📧 Alert email successfully submitted."
+            )
+        else:
+            log.warning(
+                "📧 Alert email was not sent."
+            )
+
+    except Exception as e:
+
+        log.error(
+            "Email notification exception: %s",
+            e
+        )
+
+    return alerts
+
+
+# ============================================================
+# PROCESS SENSOR READING
+# ============================================================
 
 # ============================================================
 # PROCESS SENSOR READING
@@ -724,156 +706,73 @@ def _process_reading_async(
     sound,
     wetness
 ):
-
     """
-    Process an incoming sensor sample.
+    Save the reading and check alerts.
 
-    Alert detection remains immediate, while the actual dashboard
-    update and database write are rate-limited/batched elsewhere.
+    Alerts are checked even when Supabase is unavailable.
     """
 
-    # Alerts must not wait 5 seconds. This preserves event detection.
-    check_alerts(
-        temp,
-        hum,
-        wetness,
-        sound
-    )
+    # --------------------------------------------------------
+    # Save sensor reading
+    # --------------------------------------------------------
 
+    if supabase is not None:
 
-def _alert_worker():
-
-    """
-    Process alert checks in one dedicated background thread.
-
-    This keeps network/database/email work out of the Raspberry Pi
-    request handler and avoids creating one thread per sensor packet.
-    """
-
-    while True:
-
-        temp, hum, wetness, sound = _alert_queue.get()
+        reading = {
+            "temperature": temp,
+            "humidity": hum,
+            "motion_detected": motion,
+            "sound_level": sound,
+            "wetness_detected": wetness,
+            "is_abnormal": check_abnormal(
+                temp,
+                hum
+            )
+        }
 
         try:
 
-            check_alerts(
-                temp,
-                hum,
-                wetness,
-                sound
+            supabase.table(
+                "sensor_readings"
+            ).insert(
+                reading
+            ).execute()
+
+            log.info(
+                "Sensor reading saved to Supabase"
             )
 
         except Exception as e:
 
             log.error(
-                "Alert worker error: %s",
+                "DB insert error: %s",
                 e
             )
 
-        finally:
+    # --------------------------------------------------------
+    # ALWAYS CHECK ALERTS
+    # --------------------------------------------------------
 
-            _alert_queue.task_done()
+    try:
 
-
-threading.Thread(
-    target=_alert_worker,
-    daemon=True,
-    name="alert-worker"
-).start()
-
-
-def _sensor_flush_worker():
-
-    """
-    Runs continuously in one background thread.
-
-    Every SENSOR_UPDATE_INTERVAL seconds:
-      1. Publishes only the newest sensor reading to the dashboard.
-      2. Writes the newest reading to Supabase.
-
-    This avoids creating one Python thread and one DB request for
-    every sensor packet.
-    """
-
-    global _latest_sensor_reading
-
-    while True:
-
-        # Strict 5-second cadence. We intentionally do not wake this
-        # worker for every incoming sensor packet.
-        time.sleep(SENSOR_UPDATE_INTERVAL)
-
-        with _sensor_buffer_lock:
-
-            reading = _latest_sensor_reading
-
-        if reading is None:
-            continue
-
-        # --------------------------------------------------------
-        # Update dashboard every 5 seconds
-        # --------------------------------------------------------
-
-        current_data["temperature"] = reading["temperature"]
-        current_data["humidity"] = reading["humidity"]
-        current_data["motion"] = reading["motion_detected"]
-        current_data["sound"] = reading["sound_level"]
-        current_data["wetness"] = reading["wetness_detected"]
-        current_data["last_update"] = datetime.now().isoformat()
-
-        socketio.emit(
-            "sensor_update",
-            current_data
+        check_alerts(
+            temp,
+            hum,
+            wetness,
+            sound
         )
 
-        # --------------------------------------------------------
-        # Persist only the latest sample in this 5-second window
-        # --------------------------------------------------------
+    except Exception as e:
 
-        if supabase is not None:
-
-            db_reading = {
-                "temperature": reading["temperature"],
-                "humidity": reading["humidity"],
-                "motion_detected": reading["motion_detected"],
-                "sound_level": reading["sound_level"],
-                "wetness_detected": reading["wetness_detected"],
-                "is_abnormal": check_abnormal(
-                    reading["temperature"],
-                    reading["humidity"]
-                )
-            }
-
-            try:
-
-                supabase.table(
-                    "sensor_readings"
-                ).insert(
-                    db_reading
-                ).execute()
-
-                log.info(
-                    "Sensor reading saved to Supabase "
-                    "(batched every %.1fs)",
-                    SENSOR_UPDATE_INTERVAL
-                )
-
-            except Exception as e:
-
-                log.error(
-                    "DB insert error: %s",
-                    e
-                )
+        log.exception(
+            "Alert processing failed: %s",
+            e
+        )
 
 
-# Start exactly one sensor worker instead of creating a new
-# background thread for every Raspberry Pi request.
-threading.Thread(
-    target=_sensor_flush_worker,
-    daemon=True,
-    name="sensor-flush-worker"
-).start()
-
+# ============================================================
+# HOME PAGE
+# ============================================================
 
 # ============================================================
 # HOME PAGE
@@ -921,7 +820,7 @@ def history():
 def api_current_data():
 
     return jsonify(
-        current_data
+        dict(current_data)
     )
 
 
@@ -1077,8 +976,161 @@ def clear_alerts():
 
 
 # ============================================================
+# TEST NOTIFICATION
+# ============================================================
+
+@app.route(
+    "/api/test_alert",
+    methods=["POST"]
+)
+def test_alert():
+
+    """
+    Test Socket.IO, Supabase and email notifications
+    without depending on the Raspberry Pi.
+    """
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    alert_type = str(
+        data.get(
+            "type",
+            "temperature"
+        )
+    ).lower()
+
+    if alert_type == "wetness":
+
+        alerts = [{
+            "alert_type": "wetness",
+            "severity": "critical",
+            "message": (
+                "🧪 TEST ALERT: "
+                "Wet diaper notification."
+            )
+        }]
+
+    elif alert_type == "both":
+
+        alerts = [
+            {
+                "alert_type": "temperature",
+                "severity": "critical",
+                "message": (
+                    "🧪 TEST ALERT: "
+                    "Abnormal temperature detected."
+                )
+            },
+            {
+                "alert_type": "wetness",
+                "severity": "critical",
+                "message": (
+                    "🧪 TEST ALERT: "
+                    "Wet diaper detected."
+                )
+            }
+        ]
+
+    else:
+
+        alerts = [{
+            "alert_type": "temperature",
+            "severity": "critical",
+            "message": (
+                "🧪 TEST ALERT: "
+                "Abnormal temperature detected."
+            )
+        }]
+
+    # --------------------------------------------------------
+    # Socket.IO
+    # --------------------------------------------------------
+
+    for alert in alerts:
+
+        try:
+
+            socketio.emit(
+                "new_alert",
+                alert
+            )
+
+            log.info(
+                "🧪 TEST Socket.IO alert sent: %s",
+                alert["message"]
+            )
+
+        except Exception as e:
+
+            log.error(
+                "Test Socket.IO error: %s",
+                e
+            )
+
+    # --------------------------------------------------------
+    # Supabase
+    # --------------------------------------------------------
+
+    if supabase is not None:
+
+        for alert in alerts:
+
+            try:
+
+                supabase.table(
+                    "alerts"
+                ).insert(
+                    alert
+                ).execute()
+
+                log.info(
+                    "🧪 TEST alert saved to Supabase"
+                )
+
+            except Exception as e:
+
+                log.error(
+                    "Test Supabase error: %s",
+                    e
+                )
+
+    # --------------------------------------------------------
+    # Email
+    # --------------------------------------------------------
+
+    try:
+
+        email_result = send_alert_email(
+            alerts
+        )
+
+        log.info(
+            "🧪 TEST email result: %s",
+            email_result
+        )
+
+    except Exception as e:
+
+        log.error(
+            "Test email error: %s",
+            e
+        )
+
+    return jsonify({
+        "success": True,
+        "message":
+            "Test notification triggered.",
+        "alert_count":
+            len(alerts)
+    })
+
+
+# ============================================================
 # RASPBERRY PI INGEST
 # ============================================================
+
 
 @app.route(
     "/api/ingest",
@@ -1086,16 +1138,11 @@ def clear_alerts():
 )
 def api_ingest():
 
-    global _latest_sensor_reading
+    global last_sensor_socket_emit
 
     data = request.get_json(
         silent=True
     ) or {}
-
-
-    # --------------------------------------------------------
-    # Required fields
-    # --------------------------------------------------------
 
     if (
         "temperature" not in data
@@ -1104,25 +1151,31 @@ def api_ingest():
     ):
 
         return jsonify({
-
             "error":
                 "Missing required fields: "
                 "temperature, humidity"
-
         }), 400
 
+    try:
 
-    # --------------------------------------------------------
-    # Read values
-    # --------------------------------------------------------
+        temp = float(
+            data.get("temperature")
+        )
 
-    temp = data.get(
-        "temperature"
-    )
+        hum = float(
+            data.get("humidity")
+        )
 
-    hum = data.get(
-        "humidity"
-    )
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return jsonify({
+            "error":
+                "Temperature and humidity "
+                "must be numbers"
+        }), 400
 
     motion = data.get(
         "motion_detected",
@@ -1134,74 +1187,105 @@ def api_ingest():
         0
     )
 
-    wetness = data.get(
+    wetness_raw = data.get(
         "wetness_detected",
         False
     )
 
+    if isinstance(wetness_raw, str):
 
-    # --------------------------------------------------------
-    # Store ONLY the newest sensor reading.
-    #
-    # The dashboard is deliberately updated every 5 seconds by
-    # _sensor_flush_worker(). This prevents rapid sensor traffic
-    # from flooding Socket.IO clients and Supabase.
-    # --------------------------------------------------------
-
-    reading = {
-        "temperature": temp,
-        "humidity": hum,
-        "motion_detected": motion,
-        "sound_level": sound,
-        "wetness_detected": wetness
-    }
-
-    with _sensor_buffer_lock:
-        _latest_sensor_reading = reading
-
-    # --------------------------------------------------------
-    # Queue alert processing immediately.
-    #
-    # This is intentionally separate from the 5-second dashboard
-    # update interval. The event-state logic prevents repeated
-    # alerts while the same abnormal condition remains active.
-    # --------------------------------------------------------
-
-    try:
-
-        _alert_queue.put_nowait(
-            (
-                temp,
-                hum,
-                wetness,
-                sound
+        wetness = (
+            wetness_raw.strip().lower()
+            in (
+                "true",
+                "1",
+                "yes",
+                "wet",
+                "detected",
+                "on"
             )
         )
 
-    except queue.Full:
+    else:
 
-        # Keep the request path fast if the alert worker is temporarily
-        # busy. The newest reading is already retained in the sensor
-        # buffer and will be used for the next dashboard update.
-        log.warning(
-            "Alert queue full; skipping one intermediate alert sample"
+        wetness = bool(
+            wetness_raw
         )
 
+    # --------------------------------------------------------
+    # Update current state immediately
+    # --------------------------------------------------------
+
+    current_data["temperature"] = temp
+    current_data["humidity"] = hum
+    current_data["motion"] = motion
+    current_data["sound"] = sound
+    current_data["wetness"] = wetness
+    current_data["last_update"] = (
+        datetime.now().isoformat()
+    )
 
     # --------------------------------------------------------
-    # Return immediately to Raspberry Pi
+    # Sensor dashboard update every 5 seconds
     # --------------------------------------------------------
+
+    now = time.monotonic()
+
+    should_emit = False
+
+    with sensor_emit_lock:
+
+        if (
+            now - last_sensor_socket_emit
+            >= 5.0
+        ):
+
+            last_sensor_socket_emit = now
+            should_emit = True
+
+    if should_emit:
+
+        try:
+
+            socketio.emit(
+                "sensor_update",
+                dict(current_data)
+            )
+
+        except Exception as e:
+
+            log.error(
+                "Sensor Socket.IO error: %s",
+                e
+            )
+
+    # --------------------------------------------------------
+    # Database + alert processing
+    #
+    # Alerts are checked on EVERY reading, not just every
+    # 5-second dashboard update.
+    # --------------------------------------------------------
+
+    threading.Thread(
+        target=_process_reading_async,
+        args=(
+            temp,
+            hum,
+            motion,
+            sound,
+            wetness
+        ),
+        daemon=True,
+        name="sensor-processing"
+    ).start()
 
     return jsonify({
-
         "status": "ok",
-
-        "abnormal":
-            check_abnormal(
-                temp,
-                hum
-            )
-
+        "abnormal": check_abnormal(
+            temp,
+            hum
+        ),
+        "sensor_update_interval": 5
     })
 
 
@@ -1330,22 +1414,28 @@ def video_feed():
                     )
 
 
-    response = Response(
+    return Response(
 
         generate(),
 
         mimetype=
             "multipart/x-mixed-replace; "
-            "boundary=frame"
+            "boundary=frame",
+
+        headers={
+            "Cache-Control":
+                "no-cache, no-store, must-revalidate",
+
+            "Pragma":
+                "no-cache",
+
+            "Expires":
+                "0",
+
+            "X-Accel-Buffering":
+                "no"
+        }
     )
-
-    # Prevent proxies/browser layers from buffering the MJPEG stream.
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
-    response.headers["X-Accel-Buffering"] = "no"
-
-    return response
 
 
 # ============================================================
@@ -1760,11 +1850,6 @@ if __name__ == "__main__":
         "Baby Cradle Monitoring Server "
         "starting on port %s...",
         port
-    )
-
-    log.info(
-        "Sensor dashboard update interval: %.1f seconds",
-        SENSOR_UPDATE_INTERVAL
     )
 
 
