@@ -128,6 +128,44 @@ current_data = {
 
 
 # ============================================================
+# SENSOR SAMPLING / DATABASE UPDATE INTERVAL
+# ============================================================
+
+# Raspberry Pi may send readings much faster than we want to store/display.
+# Only one reading every 5 seconds is committed to Supabase and broadcast
+# to the dashboard. The first reading is accepted immediately.
+SENSOR_UPDATE_INTERVAL = 5.0
+
+_sensor_update_lock = threading.Lock()
+_last_sensor_update_time = 0.0
+
+
+def should_commit_sensor_reading():
+    """
+    Return True only once every SENSOR_UPDATE_INTERVAL seconds.
+
+    This throttles BOTH:
+      1. Supabase sensor_readings inserts
+      2. Dashboard sensor_update Socket.IO events
+
+    The first reading after server startup is accepted immediately.
+    """
+    global _last_sensor_update_time
+
+    now = time.monotonic()
+
+    with _sensor_update_lock:
+        if (
+            _last_sensor_update_time == 0.0
+            or now - _last_sensor_update_time >= SENSOR_UPDATE_INTERVAL
+        ):
+            _last_sensor_update_time = now
+            return True
+
+        return False
+
+
+# ============================================================
 # VIDEO STREAMING
 # ============================================================
 
@@ -1433,10 +1471,16 @@ def clear_alerts():
 def api_ingest():
 
     """
-    Raspberry Pi -> Flask -> Supabase -> Dashboard -> Alerts.
+    Raspberry Pi -> Flask -> 5-second sampler -> Supabase -> Dashboard.
 
-    The API returns HTTP 200 only after the sensor reading has
-    successfully been inserted into Supabase.
+    The Raspberry Pi may send data continuously, but only one reading
+    every 5 seconds is:
+        - inserted into Supabase sensor_readings
+        - broadcast to connected dashboards
+        - passed to alert detection
+
+    This prevents the database and dashboard from being updated every
+    second while preserving the latest accepted sensor state.
     """
 
     data = request.get_json(silent=True) or {}
@@ -1456,9 +1500,7 @@ def api_ingest():
             False
         ))
 
-        # IMPORTANT:
-        # Supabase column sound_level is INTEGER.
-        # Convert 0.0, "0.0", 1.0, etc. to 0, 1, etc.
+        # sensor_readings.sound_level is INTEGER.
         sound = int(float(data.get(
             "sound_level",
             0
@@ -1484,7 +1526,21 @@ def api_ingest():
         }), 400
 
     # --------------------------------------------------------
-    # SAVE TO SUPABASE BEFORE REPORTING SUCCESS
+    # 5-SECOND SAMPLING
+    # --------------------------------------------------------
+
+    if not should_commit_sensor_reading():
+
+        return jsonify({
+            "status": "ok",
+            "message": "Sensor reading received but skipped by 5-second sampler",
+            "database_saved": False,
+            "dashboard_updated": False,
+            "next_update_seconds": SENSOR_UPDATE_INTERVAL
+        }), 200
+
+    # --------------------------------------------------------
+    # SAVE ONE READING TO SUPABASE
     # --------------------------------------------------------
 
     try:
@@ -1504,6 +1560,12 @@ def api_ingest():
             e
         )
 
+        # Allow the next incoming reading to retry immediately rather
+        # than waiting five seconds after a failed database write.
+        global _last_sensor_update_time
+        with _sensor_update_lock:
+            _last_sensor_update_time = 0.0
+
         return jsonify({
             "status": "error",
             "error": "Sensor reading could not be saved to Supabase",
@@ -1511,7 +1573,7 @@ def api_ingest():
         }), 503
 
     # --------------------------------------------------------
-    # UPDATE CURRENT DASHBOARD STATE
+    # UPDATE DASHBOARD ONLY AFTER DB SUCCESS
     # --------------------------------------------------------
 
     current_data["temperature"] = temp
@@ -1519,19 +1581,36 @@ def api_ingest():
     current_data["motion"] = motion
     current_data["sound"] = sound
     current_data["wetness"] = wetness
-    current_data["last_update"] = datetime.now().isoformat()
 
-    # --------------------------------------------------------
-    # UPDATE CONNECTED DASHBOARDS
-    # --------------------------------------------------------
+    # Use a timezone-aware Lusaka timestamp for dashboard state.
+    try:
+        from zoneinfo import ZoneInfo
+
+        current_data["last_update"] = datetime.now(
+            ZoneInfo("Africa/Lusaka")
+        ).isoformat()
+
+    except Exception:
+        current_data["last_update"] = datetime.now().isoformat()
 
     socketio.emit(
         "sensor_update",
         dict(current_data)
     )
 
+    log.info(
+        "5-SECOND UPDATE: DB saved id=%s | dashboard updated | "
+        "temperature=%.1f humidity=%.1f motion=%s sound=%d wetness=%s",
+        saved_reading.get("id"),
+        temp,
+        hum,
+        motion,
+        sound,
+        wetness
+    )
+
     # --------------------------------------------------------
-    # PROCESS ALERTS
+    # PROCESS ALERTS ONLY FOR THE STORED 5-SECOND SAMPLE
     # --------------------------------------------------------
 
     threading.Thread(
@@ -1548,7 +1627,10 @@ def api_ingest():
 
     return jsonify({
         "status": "ok",
-        "message": "Sensor reading saved to Supabase",
+        "message": "Sensor reading saved and dashboard updated",
+        "database_saved": True,
+        "dashboard_updated": True,
+        "sample_interval_seconds": SENSOR_UPDATE_INTERVAL,
         "abnormal": check_abnormal(
             temp,
             hum
@@ -1557,6 +1639,7 @@ def api_ingest():
     }), 200
 
 
+# ============================================================
 # ============================================================
 # VIDEO FRAME UPLOAD
 # ============================================================
