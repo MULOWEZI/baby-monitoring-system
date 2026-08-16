@@ -154,7 +154,12 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
   </nav>
   <div class="sidebar-footer">
     <div class="status-indicator" id="conn-indicator"><span class="dot"></span><span id="conn-status">Connecting…</span></div>
-    <div class="version">v3.0.0</div>
+    <div style="margin-top:10px;padding:10px 8px;background:var(--bg);border:1px solid var(--border);border-radius:12px;">
+      <div style="font-size:.62rem;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.6px;">Signed in as</div>
+      <div id="user-email" style="font-size:.7rem;color:var(--text-secondary);font-weight:600;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ user_email or 'User' }}</div>
+      <a href="/logout" style="display:block;margin-top:8px;font-size:.7rem;color:var(--critical);font-weight:700;text-decoration:none;">↪ Logout</a>
+    </div>
+    <div class="version">v3.1.0 • Authenticated</div>
   </div>
 </aside>
 <div class="sidebar-overlay" id="sidebarOverlay"></div>
@@ -232,6 +237,20 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
 </main>
 
 <script>
+async function verifySession(){
+  try{
+    const r = await fetch('/api/me', {credentials:'same-origin'});
+    if(r.status === 401){
+      window.location.href = '/login';
+      return false;
+    }
+    return r.ok;
+  }catch(e){
+    console.error('Session verification failed:', e);
+    return true;
+  }
+}
+
 const socket = io({
   transports: ['websocket', 'polling'],
   reconnection: true,
@@ -412,10 +431,14 @@ const dashCam = document.getElementById('dashCam');
 const dashCamEmpty = document.getElementById('dashCamEmpty');
 dashCam.onload = ()=>{ dashCam.style.display='block'; dashCamEmpty.style.display='none'; };
 dashCam.onerror = ()=>{ dashCam.style.display='none'; dashCamEmpty.style.display='flex'; };
+dashCam.src = '/video_feed';
 
-loadCurrentData();
-loadHistory();
-loadAlerts();
+verifySession().then(ok => {
+  if(!ok) return;
+  loadCurrentData();
+  loadHistory();
+  loadAlerts();
+});
 
 // Keep dashboard lightweight: it does NOT keep a permanent MJPEG stream
 // open. The dedicated Live page owns the video connection.
