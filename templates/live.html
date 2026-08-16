@@ -1,134 +1,50 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Login - Baby Cradle Monitoring System</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Live Video - Baby Cradle Monitoring System</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg:#F6F8FC;--surface:#fff;--border:#E6EBF5;
-  --primary:#3457D5;--primary-dark:#24408F;--primary-light:#EEF2FF;
-  --text:#131B2E;--muted:#7A8498;--danger:#E11D48;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  min-height:100vh;display:grid;place-items:center;padding:20px;
-  font-family:Inter,-apple-system,BlinkMacSystemFont,sans-serif;
-  background:linear-gradient(135deg,#F6F8FC,#EEF2FF);color:var(--text);
-}
-.card{
-  width:min(430px,100%);background:var(--surface);border:1px solid var(--border);
-  border-radius:24px;padding:34px;box-shadow:0 20px 60px rgba(19,27,46,.10);
-}
-.logo{
-  width:58px;height:58px;border-radius:17px;display:grid;place-items:center;
-  background:linear-gradient(135deg,var(--primary),#6C8CFF);font-size:1.6rem;
-  box-shadow:0 8px 22px rgba(52,87,213,.25);margin-bottom:20px;
-}
-h1{font:800 1.55rem 'Plus Jakarta Sans',Inter,sans-serif}
-.subtitle{color:var(--muted);font-size:.82rem;line-height:1.6;margin-top:6px;margin-bottom:25px}
-label{display:block;font-size:.72rem;font-weight:700;color:#4B5875;margin:0 0 7px}
-input{
-  width:100%;padding:13px 14px;border:1px solid var(--border);border-radius:12px;
-  background:#F8FAFD;color:var(--text);font:500 .85rem Inter;outline:none;
-  margin-bottom:16px;
-}
-input:focus{border-color:var(--primary);box-shadow:0 0 0 4px var(--primary-light)}
-.password-row{position:relative}
-.password-row input{padding-right:72px}
-.toggle{
-  position:absolute;right:9px;top:8px;border:0;background:none;padding:7px;
-  color:var(--primary);font-weight:700;font-size:.7rem;cursor:pointer
-}
-button.submit{
-  width:100%;border:0;border-radius:12px;padding:13px;background:var(--primary);
-  color:#fff;font:700 .84rem Inter;cursor:pointer;margin-top:2px
-}
-button.submit:hover{background:var(--primary-dark)}
-button.submit:disabled{opacity:.6;cursor:not-allowed}
-.error{
-  display:none;background:#FDE8ED;color:#9A1236;border:1px solid #F7C8D3;
-  border-radius:11px;padding:10px 12px;font-size:.75rem;line-height:1.5;margin-bottom:16px
-}
-.footer{text-align:center;color:var(--muted);font-size:.65rem;margin-top:22px}
+:root{--bg:#F6F8FC;--surface:#fff;--border:#E6EBF5;--primary:#3457D5;--primary-dark:#24408F;--muted:#7A8498;--text:#131B2E;--danger:#E11D48}
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:Inter,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.header{padding:22px 28px;background:#fff;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:15px}
+.brand{font:800 1rem 'Plus Jakarta Sans';}.brand small{display:block;color:var(--muted);font:500 .65rem Inter;margin-top:3px}
+.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a{padding:9px 12px;border-radius:10px;text-decoration:none;font-size:.75rem;font-weight:700;color:#4B5875}.nav a.active{background:#3457D5;color:#fff}.logout{color:var(--danger)!important}
+main{max-width:1200px;margin:0 auto;padding:28px}.title{margin-bottom:18px}.title h1{font:800 1.45rem 'Plus Jakarta Sans'}.title p{font-size:.78rem;color:var(--muted);margin-top:4px}
+.panel{background:#fff;border:1px solid var(--border);border-radius:20px;padding:20px;box-shadow:0 8px 24px rgba(19,27,46,.05)}
+.video{background:#0F1523;border-radius:15px;overflow:hidden;aspect-ratio:16/9;display:grid;place-items:center}.video img{width:100%;height:100%;object-fit:contain}.empty{color:#fff8;font-size:.85rem;text-align:center}.empty div{font-size:2rem;margin-bottom:8px}
+.status{margin-top:12px;font-size:.72rem;color:var(--muted)}.footer{text-align:center;color:var(--muted);font-size:.65rem;margin-top:18px}
+@media(max-width:700px){.header{padding:16px;align-items:flex-start;flex-direction:column}main{padding:16px}}
 </style>
 </head>
 <body>
-<div class="card">
-  <div class="logo">🚼</div>
-  <h1>Welcome back</h1>
-  <p class="subtitle">Sign in to access the Baby Cradle Monitoring System dashboard.</p>
-
-  <div class="error" id="error"></div>
-
-  <form id="loginForm">
-    <label for="email">EMAIL ADDRESS</label>
-    <input id="email" name="email" type="email" autocomplete="username"
-           placeholder="you@example.com" required>
-
-    <label for="password">PASSWORD</label>
-    <div class="password-row">
-      <input id="password" name="password" type="password" autocomplete="current-password"
-             placeholder="Enter your password" required>
-      <button class="toggle" type="button" id="togglePassword">Show</button>
+<header class="header">
+  <div class="brand">🚼 Baby Cradle<small>Smart Monitoring</small></div>
+  <nav class="nav">
+    <a href="/">📊 Dashboard</a><a href="/live" class="active">📷 Live Video</a><a href="/history">📈 History</a>
+    <a href="/logout" class="logout">Logout</a>
+  </nav>
+</header>
+<main>
+  <div class="title"><h1>Live Camera</h1><p>Authenticated real-time camera feed.</p></div>
+  <section class="panel">
+    <div class="video">
+      <img id="camera" alt="Live camera feed" style="display:none">
+      <div class="empty" id="empty"><div>📷</div><span>Waiting for camera feed…</span></div>
     </div>
-
-    <button class="submit" id="loginButton" type="submit">Sign In</button>
-  </form>
-
-  <div class="footer">Baby Cradle Monitoring System • Secure Dashboard</div>
-</div>
-
+    <div class="status" id="status">Connecting to camera…</div>
+  </section>
+  <div class="footer">Signed in as {{ user_email or 'User' }}</div>
+</main>
 <script>
-const form = document.getElementById('loginForm');
-const email = document.getElementById('email');
-const password = document.getElementById('password');
-const errorBox = document.getElementById('error');
-const button = document.getElementById('loginButton');
-const toggle = document.getElementById('togglePassword');
-
-toggle.addEventListener('click', ()=>{
-  const show = password.type === 'password';
-  password.type = show ? 'text' : 'password';
-  toggle.textContent = show ? 'Hide' : 'Show';
+const img=document.getElementById('camera'), empty=document.getElementById('empty'), status=document.getElementById('status');
+fetch('/api/me',{credentials:'same-origin'}).then(r=>{
+  if(!r.ok){location.href='/login';return;}
+  img.src='/video_feed';
 });
-
-form.addEventListener('submit', async (e)=>{
-  e.preventDefault();
-  errorBox.style.display='none';
-  button.disabled=true;
-  button.textContent='Signing in…';
-
-  try{
-    const response = await fetch('/login', {
-      method:'POST',
-      credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({
-        email:email.value.trim(),
-        password:password.value
-      })
-    });
-
-    const data = await response.json().catch(()=>({}));
-
-    if(response.ok && data.success){
-      window.location.href = data.redirect || '/';
-      return;
-    }
-
-    errorBox.textContent = data.error || 'Invalid email or password.';
-    errorBox.style.display='block';
-  }catch(err){
-    errorBox.textContent = 'Unable to reach the server. Please try again.';
-    errorBox.style.display='block';
-  }finally{
-    button.disabled=false;
-    button.textContent='Sign In';
-  }
-});
+img.onload=()=>{img.style.display='block';empty.style.display='none';status.textContent='Live camera feed connected.'};
+img.onerror=()=>{img.style.display='none';empty.style.display='grid';status.textContent='Camera feed unavailable.'};
 </script>
 </body>
 </html>
