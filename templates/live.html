@@ -1,1 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Baby Cradle Monitoring System - Live Video</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #f0f6ff;
+            --bg-secondary: #ffffff;
+            --bg-card: rgba(255, 255, 255, 0.7);
+            --card-border: rgba(0, 20, 60, 0.06);
+            --text-primary: #0a1a3a;
+            --text-secondary: #1a3a6a;
+            --text-muted: #5a7a9a;
+            --accent-1: #2563eb;
+            --accent-2: #3b82f6;
+            --accent-3: #60a5fa;
+            --gradient-main: linear-gradient(135deg, #2563eb, #3b82f6, #60a5fa);
+            --gradient-glow: linear-gradient(135deg, rgba(37, 99, 235, 0.10), rgba(96, 165, 250, 0.06));
+            --danger: #ef4444;
+            --danger-bg: rgba(239, 68, 68, 0.08);
+            --warn: #f59e0b;
+            --warn-bg: rgba(245, 158, 11, 0.08);
+            --success: #22c55e;
+            --success-bg: rgba(34, 197, 94, 0.08);
+            --border-radius: 16px;
+            --border-radius-sm: 10px;
+            --shadow-card: 0 4px 20px rgba(37, 99, 235, 0.06);
+            --shadow-hover: 0 8px 40px rgba(37, 99, 235, 0.10);
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            --sidebar-width: 230px;
+        }
 
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            overflow-x: hidden;
+        }
+
+        /* Subtle background pattern */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                radial-gradient(circle at 15% 50%, rgba(37, 99, 235, 0.04) 0%, transparent 50%),
+                radial-gradient(circle at 85% 20%, rgba(59, 130, 246, 0.04) 0%, transparent 50%),
+                radial-gradient(circle at 50% 80%, rgba(96, 165, 250, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* ===== SIDEBAR ===== */
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: var(--sidebar-width);
+            height: 100vh;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--card-border);
+            padding: 20px 14px;
+            display: flex;
+            flex-direction: column;
+            z-index: 100;
+            box-shadow: 2px 0 24px rgba(37, 99, 235, 0.04);
+            transition: var(--transition);
+            overflow-y: auto;
+        }
+
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding-bottom: 18px;
+            border-bottom: 1px solid var(--card-border);
+            margin-bottom: 18px;
+        }
+
+        .sidebar-brand .logo {
+            width: 40px;
+            height: 40px;
+            border-radius: var(--border-radius-sm);
+            display: grid;
+            place-items: center;
+            background: var(--gradient-main);
+            font-size: 1.2rem;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.25);
+            flex-shrink: 0;
+            transition: var(--transition);
+        }
+
+        .sidebar-brand .logo:hover {
+            transform: scale(1.05) rotate(-5deg);
+            box-shadow: 0 6px 20px rgba(37, 99, 235, 0.35);
+        }
+
+        .sidebar-brand .brand-text h2 {
+            font-size: 0.95rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+            line-height: 1.2;
+        }
+
+        .sidebar-brand .brand-text small {
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.55rem;
+            font-weight: 500;
+            letter-spacing: 0.3px;
+        }
+
+        .sidebar-nav {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            flex: 1;
+        }
+
+        .sidebar-nav a.link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 9px 12px;
+            border-radius: var(--border-radius-sm);
+            font-weight: 600;
+            font-size: 0.8rem;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sidebar-nav a.link i {
+            width: 18px;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            transition: var(--transition);
+        }
+
+        .sidebar-nav a.link:hover {
+            color: var(--text-primary);
+            background: rgba(37, 99, 235, 0.06);
+        }
+
+        .sidebar-nav a.link:hover i {
+            color: var(--accent-1);
+        }
+
+        .sidebar-nav a.link.active {
+            background: var(--gradient-main);
+            color: #fff;
+            box-shadow: 0 4px 16px rgba(37, 99, 235, 0.25);
+        }
+
+        .sidebar-nav a.link.active i {
+            color: #fff;
+        }
+
+        .sidebar-footer {
+            border-top: 1px solid var(--card-border);
+            padding-top: 14px;
+            margin-top: auto;
+        }
+
+        .sidebar-footer .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.65rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            padding: 4px 0;
+        }
+
+        .sidebar-footer .status-indicator .dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse-dot 2s infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .sidebar-footer .version {
+            font-size: 0.55rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* ===== MAIN CONTENT ===== */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            flex: 1;
+            padding: 20px 24px 26px;
+            min-height: 100vh;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* ===== TOP BAR ===== */
+        .top-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .top-bar .page-title h1 {
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: var(--text-primary);
+        }
+
+        .top-bar .page-title p {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 1px;
+        }
+
+        .top-bar .live-chip {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.65rem;
+            font-weight: 700;
+            color: var(--danger);
+            background: var(--danger-bg);
+            border: 1px solid rgba(239, 68, 68, 0.15);
+            padding: 6px 14px 6px 12px;
+            border-radius: 30px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .top-bar .live-chip .pulse-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--danger);
+            animation: pulse 1.8s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+
+        /* ===== MAIN GRID ===== */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 2.2fr 1fr;
+            gap: 20px;
+        }
+
+        /* ===== VIDEO PANEL ===== */
+        .video-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--card-border);
+            border-radius: var(--border-radius);
+            overflow: hidden;
+            box-shadow: var(--shadow-card);
+            transition: var(--transition);
+        }
+
+        .video-panel:hover {
+            box-shadow: var(--shadow-hover);
+            border-color: rgba(37, 99, 235, 0.10);
+        }
+
+        .video-container {
+            position: relative;
+            background: #0a1628;
+            aspect-ratio: 4/3;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .video-container img {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: contain;
+        }
+
+        .video-placeholder {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            color: var(--text-muted);
+            background: #0a1628;
+        }
+
+        .video-placeholder .big {
+            font-size: 3.2rem;
+            opacity: 0.4;
+        }
+
+        .video-placeholder span {
+            font-weight: 500;
+            font-size: 0.85rem;
+            letter-spacing: 0.3px;
+        }
+
+        .video-placeholder .spinner {
+            width: 30px;
+            height: 30px;
+            border: 2px solid rgba(255, 255, 255, 0.05);
+            border-top-color: var(--accent-1);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* REC badge */
+        .rec-chip {
+            position: absolute;
+            top: 14px;
+            left: 16px;
+            z-index: 5;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(8px);
+            color: #f87171;
+            font-size: 0.6rem;
+            font-weight: 700;
+            letter-spacing: 0.8px;
+            padding: 5px 12px 5px 10px;
+            border-radius: 30px;
+            border: 1px solid rgba(239, 68, 68, 0.15);
+        }
+
+        .rec-chip .rec-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #ef4444;
+            animation: blink 1.2s infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.15; }
+        }
+
+        /* ===== INFO PANEL ===== */
+        .info-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .info-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--card-border);
+            border-radius: var(--border-radius-sm);
+            padding: 14px 16px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            transition: var(--transition);
+            cursor: default;
+            box-shadow: var(--shadow-card);
+        }
+
+        .info-card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(37, 99, 235, 0.10);
+            box-shadow: var(--shadow-hover);
+        }
+
+        .info-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: var(--border-radius-sm);
+            display: grid;
+            place-items: center;
+            font-size: 1.1rem;
+            background: var(--gradient-glow);
+            flex-shrink: 0;
+            transition: var(--transition);
+        }
+
+        .info-card:hover .info-icon {
+            transform: scale(1.05);
+            background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(96, 165, 250, 0.06));
+        }
+
+        .info-meta {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .info-label {
+            font-size: 0.55rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            font-weight: 700;
+        }
+
+        .info-value {
+            font-size: 1.2rem;
+            font-weight: 800;
+            margin-top: 1px;
+            letter-spacing: -0.01em;
+            color: var(--text-primary);
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 12px;
+            border-radius: 30px;
+            font-size: 0.55rem;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            flex-shrink: 0;
+            transition: var(--transition);
+        }
+
+        .status-badge.normal {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+
+        .status-badge.warning {
+            background: var(--warn-bg);
+            color: var(--warn);
+        }
+
+        .status-badge.critical {
+            background: var(--danger-bg);
+            color: var(--danger);
+        }
+
+        /* ===== FOOTER ===== */
+        .footer {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.65rem;
+            padding: 16px 0 4px;
+            border-top: 1px solid var(--card-border);
+            margin-top: 20px;
+            letter-spacing: 0.3px;
+        }
+
+        .footer span {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        /* ===== RESPONSIVE ===== */
+        @media (max-width: 992px) {
+            :root {
+                --sidebar-width: 0px;
+            }
+
+            .sidebar {
+                transform: translateX(-100%);
+                width: 270px;
+                box-shadow: 4px 0 40px rgba(0, 0, 0, 0.08);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .main-content {
+                margin-left: 0;
+                padding: 14px 16px 20px;
+            }
+
+            .hamburger {
+                display: flex !important;
+            }
+
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .video-container {
+                aspect-ratio: 16/9;
+                max-height: 400px;
+            }
+        }
+
+        .hamburger {
+            display: none;
+            background: none;
+            border: none;
+            font-size: 1.3rem;
+            color: var(--text-primary);
+            cursor: pointer;
+            padding: 5px;
+            border-radius: 8px;
+            transition: var(--transition);
+        }
+
+        .hamburger:hover {
+            background: rgba(37, 99, 235, 0.06);
+        }
+
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.25);
+            z-index: 99;
+            backdrop-filter: blur(4px);
+        }
+
+        .sidebar-overlay.active {
+            display: block;
+        }
+
+        @media (max-width: 480px) {
+            .top-bar .page-title h1 {
+                font-size: 1rem;
+            }
+
+            .info-card {
+                padding: 12px 12px;
+                gap: 10px;
+            }
+
+            .info-icon {
+                width: 34px;
+                height: 34px;
+                font-size: 0.9rem;
+            }
+
+            .info-value {
+                font-size: 1rem;
+            }
+
+            .video-container {
+                max-height: 280px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ===== SIDEBAR ===== -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-brand">
+            <div class="logo">🚼</div>
+            <div class="brand-text">
+                <h2>Baby Cradle</h2>
+                <small>Smart Monitoring</small>
+            </div>
+        </div>
+
+        <nav class="sidebar-nav">
+            <a href="/" class="link">
+                <i>📊</i> Dashboard
+            </a>
+            <a href="/live" class="link active">
+                <i>📷</i> Live Video
+            </a>
+            <a href="/history" class="link">
+                <i>📈</i> History
+            </a>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="status-indicator">
+                <span class="dot"></span>
+                <span id="conn-status">Online</span>
+            </div>
+            <div class="version">v2.1.4</div>
+        </div>
+    </aside>
+
+    <!-- ===== OVERLAY FOR MOBILE ===== -->
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <main class="main-content">
+
+        <!-- Top Bar -->
+        <div class="top-bar">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <button class="hamburger" id="hamburgerBtn" aria-label="Toggle sidebar">
+                    ☰
+                </button>
+                <div class="page-title">
+                    <h1>Live Video</h1>
+                    <p>Real-time camera feed</p>
+                </div>
+            </div>
+            <div class="live-chip">
+                <span class="pulse-dot"></span>
+                Live
+            </div>
+        </div>
+
+        <!-- ===== MAIN CONTENT ===== -->
+        <div class="main-grid">
+
+            <!-- Video Panel -->
+            <section class="video-panel">
+                <div class="video-container">
+                    <!-- REC badge -->
+                    <div class="rec-chip" id="recChip" style="display:none;">
+                        <span class="rec-dot"></span>
+                        REC
+                    </div>
+
+                    <!-- Video feed -->
+                    <img src="/video_feed" alt="Live Cradle Stream" id="videoFeed" style="display:none;">
+
+                    <!-- Placeholder -->
+                    <div class="video-placeholder" id="videoPlaceholder">
+                        <div class="spinner"></div>
+                        <div class="big">📷</div>
+                        <span>Waiting for camera feed...</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Info Panel -->
+            <aside class="info-panel">
+
+                <!-- Temperature -->
+                <div class="info-card">
+                    <div class="info-icon">🌡️</div>
+                    <div class="info-meta">
+                        <div class="info-label">Temperature</div>
+                        <div class="info-value" id="temp">-- °C</div>
+                    </div>
+                    <div id="temp-badge" class="status-badge normal">Loading</div>
+                </div>
+
+                <!-- Humidity -->
+                <div class="info-card">
+                    <div class="info-icon">💧</div>
+                    <div class="info-meta">
+                        <div class="info-label">Humidity</div>
+                        <div class="info-value" id="humidity">-- %</div>
+                    </div>
+                    <div id="hum-badge" class="status-badge normal">Loading</div>
+                </div>
+
+                <!-- Motion -->
+                <div class="info-card">
+                    <div class="info-icon">🏃</div>
+                    <div class="info-meta">
+                        <div class="info-label">Motion</div>
+                        <div class="info-value" id="motion">--</div>
+                    </div>
+                </div>
+
+                <!-- Sound -->
+                <div class="info-card">
+                    <div class="info-icon">🔊</div>
+                    <div class="info-meta">
+                        <div class="info-label">Sound</div>
+                        <div class="info-value" id="sound">--</div>
+                    </div>
+                </div>
+
+                <!-- Diaper -->
+                <div class="info-card">
+                    <div class="info-icon">🚼</div>
+                    <div class="info-meta">
+                        <div class="info-label">Diaper</div>
+                        <div class="info-value" id="wetness">--</div>
+                    </div>
+                </div>
+
+            </aside>
+        </div>
+
+        <!-- ===== FOOTER ===== -->
+        <div class="footer">
+            <span>Baby Cradle Monitoring System</span> &middot; v2.1.4
+        </div>
+
+    </main>
+
+    <!-- ===== SCRIPT ===== -->
+    <script>
+        const socket = io();
+
+        // ===== SIDEBAR TOGGLE =====
+        const hamburger = document.getElementById('hamburgerBtn');
+        const sidebar = document.getElementById('sidebar');
+        const overlay = document.getElementById('sidebarOverlay');
+
+        function toggleSidebar() {
+            sidebar.classList.toggle('open');
+            overlay.classList.toggle('active');
+            document.body.style.overflow = sidebar.classList.contains('open') ? 'hidden' : '';
+        }
+
+        hamburger.addEventListener('click', toggleSidebar);
+        overlay.addEventListener('click', toggleSidebar);
+
+        document.querySelectorAll('.sidebar-nav a').forEach(link => {
+            link.addEventListener('click', () => {
+                if (window.innerWidth <= 992) {
+                    sidebar.classList.remove('open');
+                    overlay.classList.remove('active');
+                    document.body.style.overflow = '';
+                }
+            });
+        });
+
+        function getStatus(value, min, max) {
+            if (value == null) return 'normal';
+            if (value < min || value > max) return 'critical';
+            if (value < min + 2 || value > max - 2) return 'warning';
+            return 'normal';
+        }
+
+        socket.on('sensor_update', (data) => {
+            // Update values
+            document.getElementById('temp').textContent = (data.temperature || '--') + ' °C';
+            document.getElementById('humidity').textContent = (data.humidity || '--') + ' %';
+            document.getElementById('motion').textContent = data.motion ? 'Moving' : 'Quiet';
+            document.getElementById('sound').textContent = data.sound ? 'Loud' : 'Quiet';
+            document.getElementById('wetness').textContent = data.wetness ? 'Wet' : 'Dry';
+
+            // Temperature badge
+            const t = getStatus(data.temperature, 20, 25);
+            const tb = document.getElementById('temp-badge');
+            tb.className = 'status-badge ' + t;
+            tb.textContent = t === 'normal' ? 'Normal' : t === 'warning' ? 'Warning' : 'Critical';
+
+            // Humidity badge
+            const h = getStatus(data.humidity, 40, 60);
+            const hb = document.getElementById('hum-badge');
+            hb.className = 'status-badge ' + h;
+            hb.textContent = h === 'normal' ? 'Normal' : h === 'warning' ? 'Warning' : 'Critical';
+        });
+
+        socket.on('disconnect', () => {
+            document.getElementById('conn-status').textContent = 'Offline';
+        });
+        socket.on('connect', () => {
+            document.getElementById('conn-status').textContent = 'Online';
+        });
+
+        // ===== Video feed handling =====
+        const videoImg = document.getElementById('videoFeed');
+        const placeholder = document.getElementById('videoPlaceholder');
+        const recChip = document.getElementById('recChip');
+
+        videoImg.onload = () => {
+            videoImg.style.display = 'block';
+            placeholder.style.display = 'none';
+            recChip.style.display = 'flex';
+        };
+
+        videoImg.onerror = () => {
+            videoImg.style.display = 'none';
+            placeholder.style.display = 'flex';
+            recChip.style.display = 'none';
+        };
+
+        // Refresh video every 5 seconds (cache-busting)
+        setInterval(() => {
+            videoImg.src = '/video_feed?' + Date.now();
+        }, 5000);
+    </script>
+</body>
+</html>
