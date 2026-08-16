@@ -1,29 +1,69 @@
 #!/usr/bin/env python3
 
 # ============================================================
+# BABY CRADLE MONITORING SYSTEM BACKEND
+# ============================================================
+#
+# Updated sensor ingestion flow:
+#
+# Raspberry Pi
+#      ↓
+# /api/ingest
+#      ↓
+# Supabase sensor_readings INSERT
+#      ↓
+# Confirm database success
+#      ↓
+# Update dashboard current_data
+#      ↓
+# Check alerts
+#      ↓
+# Send email if abnormal
+#      ↓
+# Return success to Raspberry Pi
+#
 # IMPORTANT:
-# gevent monkey patch MUST happen before other networking
-# libraries are imported.
+# There is NO sensor-reading background queue anymore.
+# The database write is confirmed before /api/ingest
+# returns success.
+# ============================================================
+
+
+# ============================================================
+# GEVENT
 # ============================================================
 
 from gevent import monkey
 monkey.patch_all()
 
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
 import os
 import sys
-import queue
 import threading
 import logging
 from datetime import datetime
 
 import requests
-from flask import Flask, render_template, request, jsonify, Response
+
+from flask import (
+    Flask,
+    render_template,
+    request,
+    jsonify,
+    Response
+)
+
 from flask_socketio import SocketIO
+
 from dotenv import load_dotenv
 
 
 # ============================================================
-# SETUP
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -34,8 +74,17 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
+
 load_dotenv()
 
+
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
 
@@ -45,6 +94,10 @@ app.config["SECRET_KEY"] = os.getenv(
 )
 
 
+# ============================================================
+# SOCKET.IO
+# ============================================================
+
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -53,7 +106,7 @@ socketio = SocketIO(
 
 
 # ============================================================
-# CONFIGURATION
+# SENSOR CONFIGURATION
 # ============================================================
 
 TEMP_MIN = float(
@@ -73,9 +126,15 @@ HUMIDITY_MAX = float(
 )
 
 
-# Dashboard updates every 5 seconds by default
+# ============================================================
+# DASHBOARD CONFIGURATION
+# ============================================================
+
 DASHBOARD_PUSH_INTERVAL = float(
-    os.getenv("DASHBOARD_PUSH_INTERVAL", 5)
+    os.getenv(
+        "DASHBOARD_PUSH_INTERVAL",
+        5
+    )
 )
 
 
@@ -100,12 +159,21 @@ ALERT_EMAIL = os.getenv(
 
 
 # ============================================================
-# STARTUP EMAIL CONFIGURATION CHECK
+# EMAIL CONFIGURATION CHECK
 # ============================================================
 
-log.info("================================================")
-log.info("EMAIL CONFIGURATION CHECK")
-log.info("================================================")
+log.info(
+    "================================================"
+)
+
+log.info(
+    "EMAIL CONFIGURATION CHECK"
+)
+
+log.info(
+    "================================================"
+)
+
 
 if BIRD_API_KEY:
 
@@ -147,11 +215,14 @@ else:
         "ALERT_EMAIL: NOT CONFIGURED"
     )
 
-log.info("================================================")
+
+log.info(
+    "================================================"
+)
 
 
 # ============================================================
-# SUPABASE
+# SUPABASE CONFIGURATION
 # ============================================================
 
 SUPABASE_URL = os.getenv(
@@ -166,6 +237,10 @@ SUPABASE_KEY = os.getenv(
 
 supabase = None
 
+
+# ============================================================
+# CONNECT TO SUPABASE
+# ============================================================
 
 if SUPABASE_URL and SUPABASE_KEY:
 
@@ -192,14 +267,13 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 else:
 
-    log.warning(
-        "SUPABASE_URL/KEY not set — "
-        "running without database"
+    log.error(
+        "SUPABASE_URL or SUPABASE_KEY is missing."
     )
 
 
 # ============================================================
-# SHARED SENSOR DATA
+# SHARED CURRENT SENSOR DATA
 # ============================================================
 
 current_data = {
@@ -225,7 +299,7 @@ _last_broadcast_update = None
 
 
 # ============================================================
-# VIDEO
+# VIDEO STATE
 # ============================================================
 
 latest_frame = None
@@ -235,13 +309,6 @@ _frame_lock = threading.Lock()
 _frame_subscribers = []
 
 _subscribers_lock = threading.Lock()
-
-
-# ============================================================
-# SENSOR READING QUEUE
-# ============================================================
-
-_reading_queue = queue.Queue()
 
 
 # ============================================================
@@ -258,13 +325,13 @@ def _broadcast_frame(frame):
 
                 q.put_nowait(frame)
 
-            except queue.Full:
+            except Exception:
 
                 try:
 
                     q.get_nowait()
 
-                except queue.Empty:
+                except Exception:
 
                     pass
 
@@ -272,7 +339,7 @@ def _broadcast_frame(frame):
 
                     q.put_nowait(frame)
 
-                except queue.Full:
+                except Exception:
 
                     pass
 
@@ -286,9 +353,15 @@ def bird_host():
     parts = BIRD_API_KEY.split("_")
 
     region = (
+
         parts[1]
-        if len(parts) > 1 and parts[1]
-        else "us1"
+
+        if len(parts) > 1
+        and parts[1]
+
+        else
+        "us1"
+
     )
 
     return (
@@ -297,7 +370,7 @@ def bird_host():
 
 
 # ============================================================
-# SEND EMAIL
+# SEND ALERT EMAIL
 # ============================================================
 
 def send_alert_email(alerts):
@@ -305,41 +378,41 @@ def send_alert_email(alerts):
     if not alerts:
 
         log.warning(
-            "send_alert_email() called without alerts"
+            "send_alert_email() called without alerts."
         )
 
         return False
 
 
-    # --------------------------------------------------------
-    # Check API key
-    # --------------------------------------------------------
+    # ========================================================
+    # CHECK API KEY
+    # ========================================================
 
     if not BIRD_API_KEY:
 
         log.error(
-            "EMAIL NOT SENT: BIRD_API_KEY is missing"
+            "EMAIL NOT SENT: BIRD_API_KEY is missing."
         )
 
         return False
 
 
-    # --------------------------------------------------------
-    # Check destination email
-    # --------------------------------------------------------
+    # ========================================================
+    # CHECK RECIPIENT
+    # ========================================================
 
     if not ALERT_EMAIL:
 
         log.error(
-            "EMAIL NOT SENT: ALERT_EMAIL is missing"
+            "EMAIL NOT SENT: ALERT_EMAIL is missing."
         )
 
         return False
 
 
-    # --------------------------------------------------------
-    # Determine email subject
-    # --------------------------------------------------------
+    # ========================================================
+    # DETERMINE SUBJECT
+    # ========================================================
 
     alert_types = {
         alert.get("alert_type")
@@ -366,9 +439,9 @@ def send_alert_email(alerts):
         )
 
 
-    # --------------------------------------------------------
-    # Build email body
-    # --------------------------------------------------------
+    # ========================================================
+    # BUILD EMAIL ITEMS
+    # ========================================================
 
     items = ""
 
@@ -390,6 +463,10 @@ def send_alert_email(alerts):
         "%Y-%m-%d %H:%M:%S"
     )
 
+
+    # ========================================================
+    # EMAIL HTML
+    # ========================================================
 
     html = f"""
     <html>
@@ -429,24 +506,31 @@ def send_alert_email(alerts):
     """
 
 
+    # ========================================================
+    # BIRD PAYLOAD
+    # ========================================================
+
     payload = {
 
-        "from": BIRD_SENDER,
+        "from":
+            BIRD_SENDER,
 
         "to": [
             ALERT_EMAIL
         ],
 
-        "subject": subject,
+        "subject":
+            subject,
 
-        "html": html
+        "html":
+            html
 
     }
 
 
-    # --------------------------------------------------------
-    # Log before sending
-    # --------------------------------------------------------
+    # ========================================================
+    # EMAIL LOGGING
+    # ========================================================
 
     log.info(
         "================================================"
@@ -476,10 +560,14 @@ def send_alert_email(alerts):
         bird_host()
     )
 
+    log.info(
+        "================================================"
+    )
 
-    # --------------------------------------------------------
-    # Send email through Bird
-    # --------------------------------------------------------
+
+    # ========================================================
+    # SEND EMAIL
+    # ========================================================
 
     try:
 
@@ -504,9 +592,9 @@ def send_alert_email(alerts):
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # SUCCESS
-        # ----------------------------------------------------
+        # ====================================================
 
         if response.status_code in (
             200,
@@ -518,12 +606,17 @@ def send_alert_email(alerts):
             )
 
             log.info(
-                "EMAIL SENT SUCCESSFULLY"
+                "EMAIL ACCEPTED BY BIRD"
             )
 
             log.info(
                 "Bird HTTP status: %s",
                 response.status_code
+            )
+
+            log.info(
+                "Bird response: %s",
+                response.text[:1000]
             )
 
             log.info(
@@ -538,9 +631,39 @@ def send_alert_email(alerts):
             return True
 
 
-        # ----------------------------------------------------
-        # FAILURE
-        # ----------------------------------------------------
+        # ====================================================
+        # RATE LIMIT
+        # ====================================================
+
+        if response.status_code == 429:
+
+            log.error(
+                "================================================"
+            )
+
+            log.error(
+                "BIRD RATE LIMIT / SEND LIMIT REACHED"
+            )
+
+            log.error(
+                "Bird HTTP status: 429"
+            )
+
+            log.error(
+                "Bird response: %s",
+                response.text[:2000]
+            )
+
+            log.error(
+                "================================================"
+            )
+
+            return False
+
+
+        # ====================================================
+        # OTHER BIRD ERROR
+        # ====================================================
 
         log.error(
             "================================================"
@@ -557,7 +680,7 @@ def send_alert_email(alerts):
 
         log.error(
             "Bird response: %s",
-            response.text[:1000]
+            response.text[:2000]
         )
 
         log.error(
@@ -590,26 +713,39 @@ def send_alert_email(alerts):
 
 
 # ============================================================
-# ABNORMAL READING CHECK
+# CHECK WHETHER READING IS ABNORMAL
 # ============================================================
 
-def check_abnormal(temp, hum):
+def check_abnormal(
+    temp,
+    hum
+):
+
+    # --------------------------------------------------------
+    # Temperature
+    # --------------------------------------------------------
 
     if temp is not None:
 
         if (
             temp < TEMP_MIN
-            or temp > TEMP_MAX
+            or
+            temp > TEMP_MAX
         ):
 
             return True
 
 
+    # --------------------------------------------------------
+    # Humidity
+    # --------------------------------------------------------
+
     if hum is not None:
 
         if (
             hum < HUMIDITY_MIN
-            or hum > HUMIDITY_MAX
+            or
+            hum > HUMIDITY_MAX
         ):
 
             return True
@@ -622,19 +758,21 @@ def check_abnormal(temp, hum):
 # ALERT CHECK
 # ============================================================
 #
-# IMPORTANT:
+# CURRENT BEHAVIOUR:
+#
+# Every abnormal temperature reading generates an alert.
+#
+# Every wetness=true reading generates an alert.
 #
 # There is NO:
-#
-# - email cooldown
-# - email countdown
+# - countdown
+# - cooldown
 # - debounce
 #
-# Every abnormal temperature reading generates
-# an email.
-#
-# Every wetness=true reading generates an email.
-#
+# NOTE:
+# Because your Raspberry Pi sends readings frequently,
+# this can create many Bird requests and may cause 429
+# responses. The database will still be saved correctly.
 # ============================================================
 
 def check_alerts(
@@ -653,14 +791,19 @@ def check_alerts(
 
     if temp is not None:
 
-        # Temperature TOO HIGH
+        # ----------------------------------------------------
+        # TOO HIGH
+        # ----------------------------------------------------
+
         if temp > TEMP_MAX:
 
             message = (
+
                 f"🌡️ Temperature is too high: "
                 f"{temp}°C. "
                 f"Configured maximum is "
                 f"{TEMP_MAX}°C."
+
             )
 
 
@@ -679,21 +822,26 @@ def check_alerts(
 
 
             log.warning(
-                "TEMPERATURE ABOVE LIMIT: %s°C "
-                "(maximum: %s°C)",
+                "TEMPERATURE ABOVE LIMIT: "
+                "%s°C (maximum: %s°C)",
                 temp,
                 TEMP_MAX
             )
 
 
-        # Temperature TOO LOW
+        # ----------------------------------------------------
+        # TOO LOW
+        # ----------------------------------------------------
+
         elif temp < TEMP_MIN:
 
             message = (
+
                 f"🌡️ Temperature is too low: "
                 f"{temp}°C. "
                 f"Configured minimum is "
                 f"{TEMP_MIN}°C."
+
             )
 
 
@@ -712,8 +860,8 @@ def check_alerts(
 
 
             log.warning(
-                "TEMPERATURE BELOW LIMIT: %s°C "
-                "(minimum: %s°C)",
+                "TEMPERATURE BELOW LIMIT: "
+                "%s°C (minimum: %s°C)",
                 temp,
                 TEMP_MIN
             )
@@ -751,7 +899,7 @@ def check_alerts(
 
 
     # ========================================================
-    # NOTHING ABNORMAL
+    # NO ALERT
     # ========================================================
 
     if not alerts:
@@ -760,7 +908,7 @@ def check_alerts(
 
 
     # ========================================================
-    # PROCESS EACH ALERT
+    # PROCESS ALERTS
     # ========================================================
 
     for alert in alerts:
@@ -772,7 +920,7 @@ def check_alerts(
 
 
         # ----------------------------------------------------
-        # Send realtime alert to dashboard
+        # Dashboard realtime alert
         # ----------------------------------------------------
 
         socketio.emit(
@@ -789,15 +937,19 @@ def check_alerts(
 
             try:
 
-                supabase.table(
-                    "alerts"
-                ).insert(
-                    alert
-                ).execute()
+                response = (
+
+                    supabase
+                    .table("alerts")
+                    .insert(alert)
+                    .execute()
+
+                )
 
 
                 log.info(
-                    "Alert saved to Supabase"
+                    "Alert saved to Supabase: %s",
+                    response.data
                 )
 
 
@@ -821,119 +973,162 @@ def check_alerts(
     if email_result:
 
         log.info(
-            "Alert email processing completed successfully."
+            "Alert email accepted by Bird."
         )
 
     else:
 
         log.error(
-            "Alert email processing FAILED."
+            "Alert email was NOT accepted by Bird."
         )
 
 
 # ============================================================
-# SENSOR READING WORKER
+# DIRECT SENSOR DATABASE INSERT
+# ============================================================
+#
+# This replaces the old background sensor queue.
+#
+# The function returns True only if Supabase accepted
+# the sensor reading.
 # ============================================================
 
-def _reading_worker():
+def save_sensor_reading(
+    temp,
+    hum,
+    motion,
+    sound,
+    wetness
+):
 
-    while True:
+    if supabase is None:
 
-        (
+        log.error(
+            "Cannot save sensor reading: "
+            "Supabase client is not available."
+        )
+
+        return False, None
+
+
+    reading = {
+
+        "temperature":
             temp,
+
+        "humidity":
             hum,
+
+        "motion_detected":
             motion,
+
+        "sound_level":
             sound,
-            wetness
-        ) = _reading_queue.get()
 
+        "wetness_detected":
+            wetness,
 
-        try:
-
-            # =================================================
-            # SAVE SENSOR READING
-            # =================================================
-
-            if supabase is not None:
-
-                reading = {
-
-                    "temperature":
-                        temp,
-
-                    "humidity":
-                        hum,
-
-                    "motion_detected":
-                        motion,
-
-                    "sound_level":
-                        sound,
-
-                    "wetness_detected":
-                        wetness,
-
-                    "is_abnormal":
-                        check_abnormal(
-                            temp,
-                            hum
-                        )
-
-                }
-
-
-                try:
-
-                    supabase.table(
-                        "sensor_readings"
-                    ).insert(
-                        reading
-                    ).execute()
-
-
-                    log.info(
-                        "Sensor reading saved to Supabase"
-                    )
-
-
-                except Exception as e:
-
-                    log.error(
-                        "DB insert error: %s",
-                        e
-                    )
-
-
-            # =================================================
-            # CHECK ALERTS
-            # =================================================
-
-            check_alerts(
-
+        "is_abnormal":
+            check_abnormal(
                 temp,
-
-                hum,
-
-                wetness,
-
-                sound
-
+                hum
             )
 
-
-        finally:
-
-            _reading_queue.task_done()
+    }
 
 
-# ============================================================
-# START SENSOR WORKER
-# ============================================================
+    log.info(
+        "================================================"
+    )
 
-threading.Thread(
-    target=_reading_worker,
-    daemon=True
-).start()
+    log.info(
+        "SAVING SENSOR READING TO SUPABASE"
+    )
+
+    log.info(
+        "Temperature: %s°C",
+        temp
+    )
+
+    log.info(
+        "Humidity: %s%%",
+        hum
+    )
+
+    log.info(
+        "Motion: %s",
+        motion
+    )
+
+    log.info(
+        "Sound: %s",
+        sound
+    )
+
+    log.info(
+        "Wetness: %s",
+        wetness
+    )
+
+    log.info(
+        "================================================"
+    )
+
+
+    try:
+
+        response = (
+
+            supabase
+            .table("sensor_readings")
+            .insert(reading)
+            .execute()
+
+        )
+
+
+        log.info(
+            "================================================"
+        )
+
+        log.info(
+            "SENSOR READING SAVED SUCCESSFULLY"
+        )
+
+        log.info(
+            "Supabase response: %s",
+            response.data
+        )
+
+        log.info(
+            "================================================"
+        )
+
+
+        return True, response.data
+
+
+    except Exception as e:
+
+        log.error(
+            "================================================"
+        )
+
+        log.error(
+            "SENSOR READING DATABASE INSERT FAILED"
+        )
+
+        log.error(
+            "Error: %s",
+            str(e)
+        )
+
+        log.error(
+            "================================================"
+        )
+
+
+        return False, None
 
 
 # ============================================================
@@ -980,7 +1175,7 @@ def _dashboard_broadcaster():
 
 
 # ============================================================
-# PAGES
+# MAIN PAGES
 # ============================================================
 
 @app.route("/")
@@ -1008,10 +1203,12 @@ def history():
 
 
 # ============================================================
-# CURRENT DATA
+# CURRENT SENSOR DATA
 # ============================================================
 
-@app.route("/api/current_data")
+@app.route(
+    "/api/current_data"
+)
 def api_current_data():
 
     with _data_lock:
@@ -1022,15 +1219,22 @@ def api_current_data():
 
 
 # ============================================================
-# HISTORY
+# SENSOR HISTORY
 # ============================================================
 
-@app.route("/api/history")
+@app.route(
+    "/api/history"
+)
 def api_history():
 
     if supabase is None:
 
-        return jsonify([])
+        return jsonify({
+
+            "error":
+                "Supabase is not configured."
+
+        }), 500
 
 
     limit = request.args.get(
@@ -1086,12 +1290,19 @@ def api_history():
 # ALERT HISTORY
 # ============================================================
 
-@app.route("/api/alerts")
+@app.route(
+    "/api/alerts"
+)
 def api_alerts():
 
     if supabase is None:
 
-        return jsonify([])
+        return jsonify({
+
+            "error":
+                "Supabase is not configured."
+
+        }), 500
 
 
     limit = request.args.get(
@@ -1156,8 +1367,11 @@ def clear_alerts():
     if supabase is None:
 
         return jsonify({
-            "success": True
-        })
+
+            "error":
+                "Supabase is not configured."
+
+        }), 500
 
 
     try:
@@ -1179,11 +1393,20 @@ def clear_alerts():
 
 
         return jsonify({
-            "success": True
+
+            "success":
+                True
+
         })
 
 
     except Exception as e:
+
+        log.error(
+            "Clear alerts error: %s",
+            e
+        )
+
 
         return jsonify({
 
@@ -1194,7 +1417,23 @@ def clear_alerts():
 
 
 # ============================================================
-# RASPBERRY PI INGEST
+# RASPBERRY PI SENSOR INGEST
+# ============================================================
+#
+# THIS IS THE MOST IMPORTANT UPDATED SECTION.
+#
+# The backend now:
+#
+# 1. Receives sensor reading.
+# 2. Validates it.
+# 3. Saves it directly to Supabase.
+# 4. ONLY after successful DB insert:
+#       - updates dashboard
+#       - checks alerts
+#       - sends email
+# 5. Returns 200.
+#
+# If Supabase fails, Raspberry Pi receives HTTP 500.
 # ============================================================
 
 @app.route(
@@ -1203,14 +1442,43 @@ def clear_alerts():
 )
 def api_ingest():
 
+    request_received_time = (
+        datetime.now()
+    )
+
+
+    log.info(
+        "================================================"
+    )
+
+    log.info(
+        "SENSOR INGEST REQUEST RECEIVED"
+    )
+
+    log.info(
+        "Time: %s",
+        request_received_time.isoformat()
+    )
+
+
+    # ========================================================
+    # READ JSON
+    # ========================================================
+
     data = request.get_json(
         silent=True
     ) or {}
 
 
-    # --------------------------------------------------------
-    # Validate required values
-    # --------------------------------------------------------
+    log.info(
+        "Incoming sensor data: %s",
+        data
+    )
+
+
+    # ========================================================
+    # VALIDATE REQUIRED FIELDS
+    # ========================================================
 
     if (
         "temperature" not in data
@@ -1218,7 +1486,16 @@ def api_ingest():
         "humidity" not in data
     ):
 
+        log.error(
+            "Invalid sensor request: "
+            "temperature or humidity missing."
+        )
+
+
         return jsonify({
+
+            "status":
+                "error",
 
             "error":
                 "Missing required fields: "
@@ -1227,27 +1504,59 @@ def api_ingest():
         }), 400
 
 
-    # --------------------------------------------------------
-    # Read values
-    # --------------------------------------------------------
+    # ========================================================
+    # EXTRACT SENSOR VALUES
+    # ========================================================
 
-    temp = data.get(
-        "temperature"
-    )
+    try:
 
-    hum = data.get(
-        "humidity"
-    )
+        temp = float(
+            data.get(
+                "temperature"
+            )
+        )
+
+
+        hum = float(
+            data.get(
+                "humidity"
+            )
+        )
+
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        log.error(
+            "Invalid temperature or humidity value."
+        )
+
+
+        return jsonify({
+
+            "status":
+                "error",
+
+            "error":
+                "temperature and humidity "
+                "must be numeric"
+
+        }), 400
+
 
     motion = data.get(
         "motion_detected",
         False
     )
 
+
     sound = data.get(
         "sound_level",
         0
     )
+
 
     wetness = data.get(
         "wetness_detected",
@@ -1256,7 +1565,61 @@ def api_ingest():
 
 
     # ========================================================
-    # UPDATE DASHBOARD DATA IMMEDIATELY
+    # STEP 1 — SAVE TO SUPABASE FIRST
+    # ========================================================
+
+    saved, saved_data = save_sensor_reading(
+
+        temp,
+
+        hum,
+
+        motion,
+
+        sound,
+
+        wetness
+
+    )
+
+
+    # ========================================================
+    # DATABASE FAILURE
+    # ========================================================
+
+    if not saved:
+
+        log.error(
+            "================================================"
+        )
+
+        log.error(
+            "INGEST FAILED — DATABASE INSERT FAILED"
+        )
+
+        log.error(
+            "Raspberry Pi will receive HTTP 500."
+        )
+
+        log.error(
+            "================================================"
+        )
+
+
+        return jsonify({
+
+            "status":
+                "error",
+
+            "error":
+                "Sensor reading could not "
+                "be saved to database."
+
+        }), 500
+
+
+    # ========================================================
+    # STEP 2 — UPDATE DASHBOARD ONLY AFTER DB SUCCESS
     # ========================================================
 
     with _data_lock:
@@ -1284,33 +1647,88 @@ def api_ingest():
         })
 
 
-    # ========================================================
-    # SEND READING TO WORKER
-    # ========================================================
-
-    _reading_queue.put((
-
-        temp,
-
-        hum,
-
-        motion,
-
-        sound,
-
-        wetness
-
-    ))
+    log.info(
+        "Dashboard current_data updated."
+    )
 
 
     # ========================================================
-    # RETURN RESPONSE TO RASPBERRY PI
+    # STEP 3 — CHECK ALERTS
     # ========================================================
+
+    try:
+
+        check_alerts(
+
+            temp,
+
+            hum,
+
+            wetness,
+
+            sound
+
+        )
+
+    except Exception as e:
+
+        log.error(
+            "Alert processing error: %s",
+            e
+        )
+
+        # IMPORTANT:
+        # Do not fail the sensor reading because
+        # email/alert processing failed.
+        #
+        # The sensor reading is already safely stored.
+
+
+    # ========================================================
+    # STEP 4 — RETURN SUCCESS
+    # ========================================================
+
+    log.info(
+        "================================================"
+    )
+
+    log.info(
+        "SENSOR INGEST SUCCESS"
+    )
+
+    log.info(
+        "Temperature: %s°C",
+        temp
+    )
+
+    log.info(
+        "Humidity: %s%%",
+        hum
+    )
+
+    log.info(
+        "Database: SAVED"
+    )
+
+    log.info(
+        "Dashboard: UPDATED"
+    )
+
+    log.info(
+        "================================================"
+    )
+
 
     return jsonify({
 
         "status":
             "ok",
+
+        "database":
+            "saved",
+
+        "dashboard":
+            "updated",
 
         "abnormal":
             check_abnormal(
@@ -1318,7 +1736,7 @@ def api_ingest():
                 hum
             )
 
-    })
+    }), 200
 
 
 # ============================================================
@@ -1362,18 +1780,25 @@ def api_upload_frame():
 
 
     return jsonify({
-        "status": "ok"
+
+        "status":
+            "ok"
+
     })
 
 
 # ============================================================
-# VIDEO STREAM
+# LIVE VIDEO STREAM
 # ============================================================
 
-@app.route("/video_feed")
+@app.route(
+    "/video_feed"
+)
 def video_feed():
 
     def generate():
+
+        import queue
 
         q = queue.Queue(
             maxsize=1
@@ -1389,6 +1814,10 @@ def video_feed():
 
         try:
 
+            # ------------------------------------------------
+            # Send latest frame immediately
+            # ------------------------------------------------
+
             with _frame_lock:
 
                 if latest_frame is not None:
@@ -1396,14 +1825,22 @@ def video_feed():
                     yield (
 
                         b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n"
+
+                        b"Content-Type: "
+                        b"image/jpeg\r\n\r\n"
+
                         +
                         latest_frame
+
                         +
                         b"\r\n"
 
                     )
 
+
+            # ------------------------------------------------
+            # Continue streaming
+            # ------------------------------------------------
 
             while True:
 
@@ -1413,9 +1850,13 @@ def video_feed():
                 yield (
 
                     b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
+
+                    b"Content-Type: "
+                    b"image/jpeg\r\n\r\n"
+
                     +
                     frame
+
                     +
                     b"\r\n"
 
@@ -1438,8 +1879,8 @@ def video_feed():
         generate(),
 
         mimetype=(
-            "multipart/x-mixed-replace; "
-            "boundary=frame"
+            "multipart/x-mixed-replace;"
+            " boundary=frame"
         )
 
     )
@@ -1461,8 +1902,13 @@ def api_chat():
 
 
     msg = (
-        data.get("message")
+
+        data.get(
+            "message"
+        )
+
         or ""
+
     ).lower().strip()
 
 
@@ -1481,7 +1927,8 @@ def api_chat():
         d.get("temperature")
         is not None
 
-        else "--"
+        else
+        "--"
 
     )
 
@@ -1494,7 +1941,8 @@ def api_chat():
         d.get("humidity")
         is not None
 
-        else "--"
+        else
+        "--"
 
     )
 
@@ -1523,18 +1971,21 @@ def api_chat():
     )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # TEMPERATURE
-    # --------------------------------------------------------
+    # ========================================================
 
     if any(
-        w in msg
-        for w in [
+
+        word in msg
+
+        for word in [
             "temp",
             "hot",
             "cold",
             "warm"
         ]
+
     ):
 
         reply = (
@@ -1568,16 +2019,19 @@ def api_chat():
                 )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # HUMIDITY
-    # --------------------------------------------------------
+    # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+
+        word in msg
+
+        for word in [
             "humid",
             "moist"
         ]
+
     ):
 
         reply = (
@@ -1611,19 +2065,22 @@ def api_chat():
                 )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # MOTION
-    # --------------------------------------------------------
+    # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+
+        word in msg
+
+        for word in [
             "motion",
             "move",
             "moving",
             "activity",
             "active"
         ]
+
     ):
 
         reply = (
@@ -1646,19 +2103,22 @@ def api_chat():
         )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # SOUND
-    # --------------------------------------------------------
+    # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+
+        word in msg
+
+        for word in [
             "sound",
             "noise",
             "loud",
             "cry",
             "crying"
         ]
+
     ):
 
         if d.get("sound"):
@@ -1683,19 +2143,22 @@ def api_chat():
             )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # DIAPER
-    # --------------------------------------------------------
+    # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+
+        word in msg
+
+        for word in [
             "diaper",
             "wet",
             "wee",
             "nappy",
             "change"
         ]
+
     ):
 
         reply = (
@@ -1717,18 +2180,21 @@ def api_chat():
         )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # GREETING
-    # --------------------------------------------------------
+    # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+
+        word in msg
+
+        for word in [
             "hi",
             "hello",
             "hey",
             "help"
         ]
+
     ):
 
         reply = (
@@ -1741,18 +2207,21 @@ def api_chat():
         )
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATUS
-    # --------------------------------------------------------
+    # ========================================================
 
     elif any(
-        w in msg
-        for w in [
+
+        word in msg
+
+        for word in [
             "status",
             "summary",
             "all",
             "overview"
         ]
+
     ):
 
         flags = []
@@ -1811,9 +2280,9 @@ def api_chat():
             )
 
 
-    # --------------------------------------------------------
-    # UNKNOWN
-    # --------------------------------------------------------
+    # ========================================================
+    # UNKNOWN REQUEST
+    # ========================================================
 
     else:
 
@@ -1836,7 +2305,7 @@ def api_chat():
 
 
 # ============================================================
-# START DASHBOARD BROADCASTER
+# START DASHBOARD BACKGROUND TASK
 # ============================================================
 
 socketio.start_background_task(
@@ -1851,23 +2320,58 @@ socketio.start_background_task(
 if __name__ == "__main__":
 
     port = int(
+
         os.getenv(
             "PORT",
             5000
         )
+
     )
 
 
     debug = (
-        os.getenv("RENDER")
+
+        os.getenv(
+            "RENDER"
+        )
+
         is None
+
     )
 
 
     log.info(
-        "Baby Cradle Monitoring Server "
-        "starting on port %s...",
+        "================================================"
+    )
+
+    log.info(
+        "BABY CRADLE MONITORING SERVER STARTING"
+    )
+
+    log.info(
+        "Port: %s",
         port
+    )
+
+    log.info(
+        "Temperature range: %s°C - %s°C",
+        TEMP_MIN,
+        TEMP_MAX
+    )
+
+    log.info(
+        "Humidity range: %s%% - %s%%",
+        HUMIDITY_MIN,
+        HUMIDITY_MAX
+    )
+
+    log.info(
+        "Dashboard push interval: %s seconds",
+        DASHBOARD_PUSH_INTERVAL
+    )
+
+    log.info(
+        "================================================"
     )
 
 
