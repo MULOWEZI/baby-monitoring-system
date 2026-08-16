@@ -697,6 +697,56 @@ def check_alerts(
 # PROCESS SENSOR READING
 # ============================================================
 
+def save_sensor_reading_to_supabase(
+    temp,
+    hum,
+    motion,
+    sound,
+    wetness
+):
+    """
+    Save one sensor reading using the exact PostgreSQL types
+    defined in the sensor_readings table.
+    """
+
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase is not configured. Check SUPABASE_URL and SUPABASE_KEY."
+        )
+
+    # sensor_readings.sound_level is INTEGER.
+    # This guarantees that 0.0 / "0.0" becomes integer 0.
+    reading = {
+        "temperature": float(temp),
+        "humidity": float(hum),
+        "motion_detected": bool(motion),
+        "sound_level": int(float(sound)),
+        "wetness_detected": bool(wetness),
+        "is_abnormal": bool(check_abnormal(float(temp), float(hum)))
+    }
+
+    log.info("Supabase sensor payload: %s", reading)
+
+    response = (
+        supabase
+        .table("sensor_readings")
+        .insert(reading)
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            "Supabase returned no inserted sensor reading."
+        )
+
+    log.info(
+        "Sensor reading saved to Supabase: id=%s",
+        response.data[0].get("id")
+    )
+
+    return response.data[0]
+
+
 def _process_reading_async(
     temp,
     hum,
@@ -704,77 +754,27 @@ def _process_reading_async(
     sound,
     wetness
 ):
-
     """
-    Saves the sensor reading to Supabase and checks
-    for new alert events.
+    Process alerts after the sensor reading has already been
+    successfully saved to Supabase.
     """
 
-
-    # ========================================================
-    # SAVE SENSOR READING
-    # ========================================================
-
-    if supabase is not None:
-
-        reading = {
-
-            "temperature": temp,
-
-            "humidity": hum,
-
-            "motion_detected": motion,
-
-            "sound_level": sound,
-
-            "wetness_detected": wetness,
-
-            "is_abnormal":
-                check_abnormal(
-                    temp,
-                    hum
-                )
-        }
+    try:
+        check_alerts(
+            temp,
+            hum,
+            wetness,
+            sound
+        )
+    except Exception as e:
+        log.error(
+            "Alert processing error: %s",
+            e
+        )
 
 
-        try:
-
-            supabase.table(
-                "sensor_readings"
-            ).insert(
-                reading
-            ).execute()
-
-
-            log.info(
-                "Sensor reading saved to Supabase"
-            )
-
-
-        except Exception as e:
-
-            log.error(
-                "DB insert error: %s",
-                e
-            )
-
-
-    # ========================================================
-    # CHECK ALERTS
-    # ========================================================
-
-    check_alerts(
-
-        temp,
-
-        hum,
-
-        wetness,
-
-        sound
-    )
-
-
+# ============================================================
+# HOME PAGE
 # ============================================================
 # HOME PAGE
 # ============================================================
@@ -825,6 +825,55 @@ def api_current_data():
     )
 
 
+# ============================================================
+# SUPABASE DATABASE HEALTH CHECK
+# ============================================================
+
+@app.route(
+    "/api/db_health",
+    methods=["GET"]
+)
+def api_db_health():
+
+    if supabase is None:
+        return jsonify({
+            "status": "error",
+            "database": "not_configured",
+            "message": "SUPABASE_URL or SUPABASE_KEY is missing"
+        }), 503
+
+    try:
+
+        supabase.table(
+            "sensor_readings"
+        ).select(
+            "id"
+        ).limit(
+            1
+        ).execute()
+
+        return jsonify({
+            "status": "ok",
+            "database": "connected",
+            "table": "sensor_readings"
+        }), 200
+
+    except Exception as e:
+
+        log.error(
+            "Supabase health check failed: %s",
+            e
+        )
+
+        return jsonify({
+            "status": "error",
+            "database": "unavailable",
+            "details": str(e)
+        }), 503
+
+
+# ============================================================
+# SENSOR HISTORY
 # ============================================================
 # SENSOR HISTORY
 # ============================================================
@@ -986,95 +1035,110 @@ def clear_alerts():
 )
 def api_ingest():
 
-    data = request.get_json(
-        silent=True
-    ) or {}
+    """
+    Raspberry Pi -> Flask -> Supabase -> Dashboard -> Alerts.
 
+    The API returns HTTP 200 only after the sensor reading has
+    successfully been inserted into Supabase.
+    """
 
-    # --------------------------------------------------------
-    # Required fields
-    # --------------------------------------------------------
+    data = request.get_json(silent=True) or {}
 
-    if (
-        "temperature" not in data
-        or
-        "humidity" not in data
-    ):
-
+    if "temperature" not in data or "humidity" not in data:
         return jsonify({
-
-            "error":
-                "Missing required fields: "
-                "temperature, humidity"
-
+            "status": "error",
+            "error": "Missing required fields: temperature, humidity"
         }), 400
 
+    try:
+        temp = float(data.get("temperature"))
+        hum = float(data.get("humidity"))
+
+        motion = bool(data.get(
+            "motion_detected",
+            False
+        ))
+
+        # IMPORTANT:
+        # Supabase column sound_level is INTEGER.
+        # Convert 0.0, "0.0", 1.0, etc. to 0, 1, etc.
+        sound = int(float(data.get(
+            "sound_level",
+            0
+        )))
+
+        wetness = bool(data.get(
+            "wetness_detected",
+            False
+        ))
+
+    except (TypeError, ValueError) as e:
+
+        log.error(
+            "Invalid sensor payload: %s | payload=%s",
+            e,
+            data
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "Invalid sensor data",
+            "details": str(e)
+        }), 400
 
     # --------------------------------------------------------
-    # Read values
+    # SAVE TO SUPABASE BEFORE REPORTING SUCCESS
     # --------------------------------------------------------
 
-    temp = data.get(
-        "temperature"
-    )
+    try:
 
-    hum = data.get(
-        "humidity"
-    )
+        saved_reading = save_sensor_reading_to_supabase(
+            temp,
+            hum,
+            motion,
+            sound,
+            wetness
+        )
 
-    motion = data.get(
-        "motion_detected",
-        False
-    )
+    except Exception as e:
 
-    sound = data.get(
-        "sound_level",
-        0
-    )
+        log.error(
+            "Supabase sensor reading save failed: %s",
+            e
+        )
 
-    wetness = data.get(
-        "wetness_detected",
-        False
-    )
-
+        return jsonify({
+            "status": "error",
+            "error": "Sensor reading could not be saved to Supabase",
+            "details": str(e)
+        }), 503
 
     # --------------------------------------------------------
-    # Update current dashboard data
+    # UPDATE CURRENT DASHBOARD STATE
     # --------------------------------------------------------
 
     current_data["temperature"] = temp
-
     current_data["humidity"] = hum
-
     current_data["motion"] = motion
-
     current_data["sound"] = sound
-
     current_data["wetness"] = wetness
-
-    current_data["last_update"] = (
-        datetime.now().isoformat()
-    )
-
+    current_data["last_update"] = datetime.now().isoformat()
 
     # --------------------------------------------------------
-    # Push sensor update to dashboard
+    # UPDATE CONNECTED DASHBOARDS
     # --------------------------------------------------------
 
     socketio.emit(
         "sensor_update",
-        current_data
+        dict(current_data)
     )
 
-
     # --------------------------------------------------------
-    # Process database + alerts in background
+    # PROCESS ALERTS
     # --------------------------------------------------------
 
     threading.Thread(
-
         target=_process_reading_async,
-
         args=(
             temp,
             hum,
@@ -1082,29 +1146,22 @@ def api_ingest():
             sound,
             wetness
         ),
-
         daemon=True
-
     ).start()
 
-
-    # --------------------------------------------------------
-    # Return immediately to Raspberry Pi
-    # --------------------------------------------------------
-
     return jsonify({
-
         "status": "ok",
+        "message": "Sensor reading saved to Supabase",
+        "abnormal": check_abnormal(
+            temp,
+            hum
+        ),
+        "reading": saved_reading
+    }), 200
 
-        "abnormal":
-            check_abnormal(
-                temp,
-                hum
-            )
 
-    })
-
-
+# ============================================================
+# VIDEO FRAME UPLOAD
 # ============================================================
 # VIDEO FRAME UPLOAD
 # ============================================================
