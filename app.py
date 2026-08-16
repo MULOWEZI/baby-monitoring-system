@@ -1,3 +1,4 @@
+import hmac
 #!/usr/bin/env python3
 # Must run before ANY other import — requests/supabase/ssl/socket/threading
 # all need to be patched before they're first imported, or gevent silently
@@ -49,9 +50,6 @@ ALERT_DEBOUNCE_READINGS = int(os.getenv("ALERT_DEBOUNCE_READINGS", 2))
 # Cooldown: hard floor on how often an email can go out for the SAME alert
 # type, regardless of how the state flips. Protects against rapid toggling
 # and against Render restarts resetting in-memory state and re-firing.
-# Safety cooldown. Normally an email is sent only when a NEW confirmed
-# abnormal event starts. This prevents rapid sensor flickering from
-# generating many emails.
 ALERT_EMAIL_COOLDOWN_SECONDS = float(
     os.getenv("ALERT_EMAIL_COOLDOWN_SECONDS", 600)
 )
@@ -103,11 +101,11 @@ previous_wetness = False               # debounced/confirmed state
 previous_temperature_abnormal = False  # debounced/confirmed state
 _wetness_streak = 0                    # consecutive readings disagreeing with confirmed state
 _temp_streak = 0
-_last_email_sent = {}                  # alert_type -> unix timestamp
+_last_email_sent = {}
 _email_alert_active = {
     "temperature": False,
     "wetness": False,
-}
+}                  # alert_type -> unix timestamp of last email sent
 
 
 def _broadcast_frame(frame):
@@ -133,6 +131,58 @@ def bird_host():
     parts = BIRD_API_KEY.split("_")
     region = parts[1] if len(parts) > 1 and parts[1] else "us1"
     return f"https://{region}.platform.bird.com"
+
+
+def _send_email_background(alerts):
+    """
+    Send email outside the sensor request path.
+
+    The email timestamp is updated ONLY after Bird reports success.
+    Therefore a failed email attempt does not incorrectly suppress the
+    next valid attempt.
+    """
+
+    try:
+
+        log.warning(
+            "EMAIL WORKER STARTED: %d alert(s)",
+            len(alerts)
+        )
+
+        result = send_alert_email(alerts)
+
+        # send_alert_email() should return True only when Bird accepts
+        # the request. If an older version returns None, treat that as
+        # failure rather than falsely marking the email as sent.
+        if result is True:
+
+            now = time.time()
+
+            with alert_state_lock:
+
+                for alert in alerts:
+
+                    alert_type = alert.get("alert_type")
+
+                    if alert_type:
+                        _last_email_sent[alert_type] = now
+
+            log.warning(
+                "EMAIL SENT SUCCESSFULLY"
+            )
+
+        else:
+
+            log.error(
+                "EMAIL NOT SENT: send_alert_email() did not report success."
+            )
+
+    except Exception as e:
+
+        log.exception(
+            "EMAIL WORKER FAILED: %s",
+            e
+        )
 
 
 def send_alert_email(alerts):
@@ -196,14 +246,15 @@ def check_abnormal(temp, hum):
 
 def check_alerts(temp, hum, wetness, sound):
     """
-    Event-based alert logic.
+    Event-based alert system.
 
-    - Requires ALERT_DEBOUNCE_READINGS consecutive readings.
-    - Sends ONE email when a confirmed abnormal condition starts.
-    - Sends NO further emails while that same condition remains active.
-    - Resets after the condition is confirmed normal.
-    - A later abnormal event can send a new email, subject to the
-      safety cooldown.
+    Email policy:
+      - Two consecutive abnormal readings confirm an event.
+      - One email is sent when the event starts.
+      - No repeated emails while the event remains active.
+      - Recovery resets the event.
+      - A later event can generate a new email.
+      - A safety cooldown protects against rapid sensor oscillation.
     """
 
     global previous_wetness, previous_temperature_abnormal
@@ -213,6 +264,7 @@ def check_alerts(temp, hum, wetness, sound):
         temp is not None
         and (temp < TEMP_MIN or temp > TEMP_MAX)
     )
+
     raw_wetness = bool(wetness)
     alerts = []
     now = time.time()
@@ -220,7 +272,7 @@ def check_alerts(temp, hum, wetness, sound):
     with alert_state_lock:
 
         # --------------------------------------------------------
-        # TEMPERATURE
+        # TEMPERATURE DEBOUNCE
         # --------------------------------------------------------
 
         if raw_temperature_abnormal != previous_temperature_abnormal:
@@ -234,27 +286,26 @@ def check_alerts(temp, hum, wetness, sound):
             previous_temperature_abnormal = raw_temperature_abnormal
             _temp_streak = 0
 
-            # Only NORMAL -> ABNORMAL can generate an email.
             if not old_state and raw_temperature_abnormal:
+
+                if temp > TEMP_MAX:
+                    message = (
+                        f"🌡️ Temperature is too high: {temp}°C. "
+                        f"Configured maximum is {TEMP_MAX}°C."
+                    )
+                elif temp < TEMP_MIN:
+                    message = (
+                        f"🌡️ Temperature is too low: {temp}°C. "
+                        f"Configured minimum is {TEMP_MIN}°C."
+                    )
+                else:
+                    message = (
+                        f"🌡️ Abnormal temperature detected: {temp}°C."
+                    )
 
                 last_sent = _last_email_sent.get("temperature", 0)
 
                 if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
-
-                    if temp > TEMP_MAX:
-                        message = (
-                            f"🌡️ Temperature is too high: {temp}°C. "
-                            f"Configured maximum is {TEMP_MAX}°C."
-                        )
-                    elif temp < TEMP_MIN:
-                        message = (
-                            f"🌡️ Temperature is too low: {temp}°C. "
-                            f"Configured minimum is {TEMP_MIN}°C."
-                        )
-                    else:
-                        message = (
-                            f"🌡️ Abnormal temperature detected: {temp}°C."
-                        )
 
                     alerts.append({
                         "alert_type": "temperature",
@@ -262,21 +313,33 @@ def check_alerts(temp, hum, wetness, sound):
                         "message": message
                     })
 
-                    _last_email_sent["temperature"] = now
                     _email_alert_active["temperature"] = True
 
-            # ABNORMAL -> NORMAL resets the event.
+                    log.warning(
+                        "CONFIRMED TEMPERATURE ALERT: %s",
+                        message
+                    )
+
+                else:
+
+                    _email_alert_active["temperature"] = True
+
+                    log.warning(
+                        "TEMPERATURE ALERT confirmed, but email cooldown "
+                        "is active. No email sent."
+                    )
+
             elif old_state and not raw_temperature_abnormal:
 
                 _email_alert_active["temperature"] = False
 
                 log.info(
-                    "Temperature recovered; future abnormal events "
-                    "may send a new email."
+                    "Temperature recovered. "
+                    "Future abnormal temperature events may email."
                 )
 
         # --------------------------------------------------------
-        # WETNESS
+        # WETNESS DEBOUNCE
         # --------------------------------------------------------
 
         if raw_wetness != previous_wetness:
@@ -290,7 +353,6 @@ def check_alerts(temp, hum, wetness, sound):
             previous_wetness = raw_wetness
             _wetness_streak = 0
 
-            # Only DRY -> WET can generate an email.
             if not old_state and raw_wetness:
 
                 last_sent = _last_email_sent.get("wetness", 0)
@@ -306,30 +368,35 @@ def check_alerts(temp, hum, wetness, sound):
                         )
                     })
 
-                    _last_email_sent["wetness"] = now
                     _email_alert_active["wetness"] = True
 
-            # WET -> DRY resets the event.
+                    log.warning(
+                        "CONFIRMED WETNESS ALERT"
+                    )
+
+                else:
+
+                    _email_alert_active["wetness"] = True
+
+                    log.warning(
+                        "WETNESS ALERT confirmed, but email cooldown "
+                        "is active. No email sent."
+                    )
+
             elif old_state and not raw_wetness:
 
                 _email_alert_active["wetness"] = False
 
                 log.info(
-                    "Wetness cleared; future wetness events "
-                    "may send a new email."
+                    "Wetness cleared. "
+                    "Future wetness events may email."
                 )
 
     if not alerts:
         return
 
-    # Create dashboard/Supabase alert records only for confirmed
-    # NEW events.
+    # Store the confirmed alert immediately.
     for alert in alerts:
-
-        log.info(
-            "NEW ALERT: %s",
-            alert["message"]
-        )
 
         socketio.emit(
             "new_alert",
@@ -339,7 +406,10 @@ def check_alerts(temp, hum, wetness, sound):
         if supabase is not None:
 
             try:
-                supabase.table("alerts").insert(alert).execute()
+
+                supabase.table("alerts").insert(
+                    alert
+                ).execute()
 
             except Exception as e:
 
@@ -348,14 +418,19 @@ def check_alerts(temp, hum, wetness, sound):
                     e
                 )
 
-    # Email is sent in a separate thread so Bird/network latency
-    # cannot block the sensor worker.
-    threading.Thread(
-        target=send_alert_email,
-        args=(alerts,),
-        daemon=True,
-        name="email-alert-worker"
-    ).start()
+    # IMPORTANT:
+    # Use Flask-SocketIO's background-task mechanism rather than
+    # manually creating a thread. This is safer with the gevent
+    # worker used by Render.
+    socketio.start_background_task(
+        _send_email_background,
+        alerts
+    )
+
+    log.warning(
+        "EMAIL QUEUED: %d alert(s)",
+        len(alerts)
+    )
 
 
 # ============================================================
@@ -630,3 +705,65 @@ if __name__ == "__main__":
     debug = os.getenv("RENDER") is None
     log.info("Baby Cradle Monitoring Server starting on port %s...", port)
     socketio.run(app, host="0.0.0.0", port=port, debug=debug, allow_unsafe_werkzeug=True)
+
+# ============================================================
+# EMAIL TEST ENDPOINT
+# ============================================================
+
+@app.route("/api/test-email", methods=["POST"])
+def test_email():
+
+    """
+    Manually test the Bird email configuration without requiring
+    a real sensor alarm.
+
+    Protect it with EMAIL_TEST_TOKEN in Render environment variables.
+
+    Example:
+        POST /api/test-email
+        Header: X-Email-Test-Token: <token>
+    """
+
+    expected_token = os.getenv("EMAIL_TEST_TOKEN")
+
+    if not expected_token:
+
+        return jsonify({
+            "ok": False,
+            "error": "EMAIL_TEST_TOKEN is not configured on the server."
+        }), 503
+
+    supplied_token = request.headers.get(
+        "X-Email-Test-Token",
+        ""
+    )
+
+    if not hmac.compare_digest(
+        supplied_token,
+        expected_token
+    ):
+
+        return jsonify({
+            "ok": False,
+            "error": "Unauthorized."
+        }), 401
+
+    test_alerts = [{
+        "alert_type": "test",
+        "severity": "info",
+        "message": "📧 Baby Monitor email test from Render."
+    }]
+
+    socketio.start_background_task(
+        _send_email_background,
+        test_alerts
+    )
+
+    log.warning(
+        "TEST EMAIL QUEUED from /api/test-email"
+    )
+
+    return jsonify({
+        "ok": True,
+        "message": "Test email queued. Check Render logs for Bird response."
+    }), 202
