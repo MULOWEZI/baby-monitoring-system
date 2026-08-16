@@ -154,12 +154,7 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
   </nav>
   <div class="sidebar-footer">
     <div class="status-indicator" id="conn-indicator"><span class="dot"></span><span id="conn-status">Connecting…</span></div>
-    <div style="margin-top:10px;padding:10px 8px;background:var(--bg);border:1px solid var(--border);border-radius:12px;">
-      <div style="font-size:.62rem;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.6px;">Signed in as</div>
-      <div id="user-email" style="font-size:.7rem;color:var(--text-secondary);font-weight:600;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ user_email or 'User' }}</div>
-      <a href="/logout" style="display:block;margin-top:8px;font-size:.7rem;color:var(--critical);font-weight:700;text-decoration:none;">↪ Logout</a>
-    </div>
-    <div class="version">v3.1.0 • Authenticated</div>
+    <div class="version">v3.0.0</div>
   </div>
 </aside>
 <div class="sidebar-overlay" id="sidebarOverlay"></div>
@@ -205,7 +200,7 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
     <div class="panel">
       <div class="panel-header"><span class="dot-accent"></span><h2>Live Camera</h2><span class="sub">Real-time feed</span></div>
       <div class="video-box">
-        <img alt="Live Camera" id="dashCam" style="display:none;">
+        <img src="/video_feed" alt="Live Camera" id="dashCam" style="display:none;">
         <div class="video-empty" id="dashCamEmpty"><div class="big">📷</div><div>Waiting for camera feed...</div></div>
       </div>
       <a href="/live" class="video-link">Open full live view →</a>
@@ -237,27 +232,7 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
 </main>
 
 <script>
-async function verifySession(){
-  try{
-    const r = await fetch('/api/me', {credentials:'same-origin'});
-    if(r.status === 401){
-      window.location.href = '/login';
-      return false;
-    }
-    return r.ok;
-  }catch(e){
-    console.error('Session verification failed:', e);
-    return true;
-  }
-}
-
-const socket = io({
-  transports: ['websocket', 'polling'],
-  reconnection: true,
-  reconnectionAttempts: 5,
-  reconnectionDelay: 1000,
-  timeout: 5000
-});
+const socket = io();
 let lastUpdateTs = null;
 
 const hamburger = document.getElementById('hamburgerBtn');
@@ -431,37 +406,11 @@ const dashCam = document.getElementById('dashCam');
 const dashCamEmpty = document.getElementById('dashCamEmpty');
 dashCam.onload = ()=>{ dashCam.style.display='block'; dashCamEmpty.style.display='none'; };
 dashCam.onerror = ()=>{ dashCam.style.display='none'; dashCamEmpty.style.display='flex'; };
-dashCam.src = '/video_feed';
 
-verifySession().then(ok => {
-  if(!ok) return;
-  loadCurrentData();
-  loadHistory();
-  loadAlerts();
-});
-
-// Keep dashboard lightweight: it does NOT keep a permanent MJPEG stream
-// open. The dedicated Live page owns the video connection.
-let dashboardRefreshTimer = setInterval(() => {
-  loadHistory();
-  loadAlerts();
-}, 60000);
-
-function cleanupDashboardPage() {
-  if (dashboardRefreshTimer) {
-    clearInterval(dashboardRefreshTimer);
-    dashboardRefreshTimer = null;
-  }
-  try {
-    if (socket && socket.connected) socket.disconnect();
-  } catch (e) {}
-}
-
-window.addEventListener('pagehide', cleanupDashboardPage, { once: true });
-window.addEventListener('beforeunload', cleanupDashboardPage, { once: true });
-document.querySelectorAll('.sidebar-nav a').forEach(link => {
-  link.addEventListener('click', cleanupDashboardPage, { once: true });
-});
+loadCurrentData();
+loadHistory();
+loadAlerts();
+setInterval(()=>{ loadHistory(); loadAlerts(); }, 30000);
 </script>
 </body>
 </html>
