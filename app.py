@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# Must run before ANY other import — requests/supabase/ssl/socket/threading
+# all need to be patched before they're first imported, or gevent silently
+# mixes patched and unpatched networking primitives (no exception raised,
+# calls just vanish). This must stay the first code in the file.
+from gevent import monkey
+monkey.patch_all()
+
 import os
 import sys
 import time
