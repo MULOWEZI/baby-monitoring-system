@@ -16,7 +16,7 @@ import hmac
 from datetime import datetime
 
 import requests
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for
 from flask_socketio import SocketIO
 from dotenv import load_dotenv
 
@@ -30,8 +30,33 @@ log = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "baby-monitor-secret-key")
+app.config["SECRET_KEY"] = os.getenv(
+    "SECRET_KEY",
+    "change-this-secret-in-render"
+)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("RENDER", "").lower() in (
+    "1", "true", "yes"
+)
+
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+
+# Socket.IO authentication
+# The browser must already have a valid Flask session before it can
+# subscribe to live sensor events. Raspberry Pi device endpoints do not
+# use this browser session.
+@socketio.on("connect")
+def socket_connect(auth=None):
+    if not is_logged_in():
+        log.warning("Rejected unauthenticated Socket.IO connection")
+        return False
+
+    log.info(
+        "Authenticated Socket.IO connection: %s",
+        session.get("user_email", "unknown")
+    )
+    return True
 
 # ============================================================
 # CONFIG (read once, not per-request)
@@ -75,6 +100,77 @@ if SUPABASE_URL and SUPABASE_KEY:
         log.warning("Supabase initialization failed: %s", e)
 else:
     log.warning("SUPABASE_URL/KEY not set — running without database")
+
+# ============================================================
+# AUTHENTICATION — SUPABASE AUTH
+# ============================================================
+# Browser pages/APIs require a Flask session created after a successful
+# Supabase Auth sign-in. Raspberry Pi ingest/upload endpoints intentionally
+# remain device-facing and are not protected by the browser session.
+
+def is_logged_in():
+    return bool(session.get("user_id"))
+
+
+def login_required_page(view):
+    """
+    Protect normal HTML pages.
+    Unauthenticated users are redirected to /login.
+    """
+    from functools import wraps
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+
+        if not is_logged_in():
+            return redirect(url_for("login"))
+
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def login_required_api(view):
+    """
+    Protect browser API endpoints.
+    Returns JSON 401 instead of redirecting.
+    """
+    from functools import wraps
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+
+        if not is_logged_in():
+            return jsonify({
+                "error": "Authentication required"
+            }), 401
+
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def get_auth_client():
+    """
+    Create a separate Supabase client for authentication.
+    The service-role key must NOT be used for user login.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+
+    try:
+        from supabase import create_client
+        return create_client(
+            SUPABASE_URL,
+            SUPABASE_KEY
+        )
+    except Exception as e:
+        log.error(
+            "Could not create Supabase auth client: %s",
+            e
+        )
+        return None
+
 
 # ============================================================
 # SHARED STATE
@@ -629,31 +725,170 @@ def _dashboard_broadcaster():
 # ============================================================
 # PAGES
 # ============================================================
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "GET":
+
+        if is_logged_in():
+            return redirect(url_for("index"))
+
+        return render_template("login.html")
+
+    data = request.get_json(silent=True)
+
+    if data:
+        email = (data.get("email") or "").strip().lower()
+        password = data.get("password") or ""
+    else:
+        email = (request.form.get("email") or "").strip().lower()
+        password = request.form.get("password") or ""
+
+    if not email or not password:
+
+        if data:
+            return jsonify({
+                "success": False,
+                "error": "Email and password are required."
+            }), 400
+
+        return render_template(
+            "login.html",
+            error="Email and password are required."
+        )
+
+    auth_client = get_auth_client()
+
+    if auth_client is None:
+
+        if data:
+            return jsonify({
+                "success": False,
+                "error": "Authentication service is not configured."
+            }), 503
+
+        return render_template(
+            "login.html",
+            error="Authentication service is not configured."
+        )
+
+    try:
+
+        result = auth_client.auth.sign_in_with_password({
+            "email": email,
+            "password": password
+        })
+
+        user = getattr(result, "user", None)
+
+        if user is None:
+            raise ValueError("Invalid login response from Supabase.")
+
+        # Store only non-sensitive session information.
+        session.clear()
+        session["user_id"] = user.id
+        session["user_email"] = user.email
+
+        log.info(
+            "Successful dashboard login: %s",
+            user.email
+        )
+
+        if data:
+            return jsonify({
+                "success": True,
+                "redirect": url_for("index")
+            })
+
+        return redirect(url_for("index"))
+
+    except Exception as e:
+
+        log.warning(
+            "Dashboard login failed for %s: %s",
+            email,
+            e
+        )
+
+        message = "Invalid email or password."
+
+        if data:
+            return jsonify({
+                "success": False,
+                "error": message
+            }), 401
+
+        return render_template(
+            "login.html",
+            error=message,
+            email=email
+        ), 401
+
+
+@app.route("/logout")
+def logout():
+
+    email = session.get("user_email")
+
+    session.clear()
+
+    if email:
+        log.info(
+            "Dashboard logout: %s",
+            email
+        )
+
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required_page
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        user_email=session.get("user_email")
+    )
 
 
 @app.route("/live")
+@login_required_page
 def live():
-    return render_template("live.html")
+    return render_template(
+        "live.html",
+        user_email=session.get("user_email")
+    )
 
 
 @app.route("/history")
+@login_required_page
 def history():
-    return render_template("history.html")
+    return render_template(
+        "history.html",
+        user_email=session.get("user_email")
+    )
 
 
 # ============================================================
 # API — CURRENT DATA / HISTORY / ALERTS
 # ============================================================
+@app.route("/api/me")
+@login_required_api
+def api_me():
+    return jsonify({
+        "id": session.get("user_id"),
+        "email": session.get("user_email")
+    })
+
+
 @app.route("/api/current_data")
+@login_required_api
 def api_current_data():
     with _data_lock:
         return jsonify(current_data)
 
 
 @app.route("/api/history")
+@login_required_api
 def api_history():
     if supabase is None:
         return jsonify([])
@@ -668,6 +903,7 @@ def api_history():
 
 
 @app.route("/api/alerts")
+@login_required_api
 def api_alerts():
     if supabase is None:
         return jsonify([])
@@ -682,6 +918,7 @@ def api_alerts():
 
 
 @app.route("/api/clear_alerts", methods=["POST"])
+@login_required_api
 def clear_alerts():
     if supabase is None:
         return jsonify({"success": True})
@@ -861,6 +1098,7 @@ def api_upload_frame():
 # VIDEO — LIVE MJPEG STREAM (event-driven, stays real-time)
 # ============================================================
 @app.route("/video_feed")
+@login_required_api
 def video_feed():
     def generate():
         q = queue.Queue(maxsize=1)
@@ -885,6 +1123,7 @@ def video_feed():
 # CHATBOT
 # ============================================================
 @app.route("/api/chat", methods=["POST"])
+@login_required_api
 def api_chat():
     data = request.get_json(silent=True) or {}
     msg = (data.get("message") or "").lower().strip()
