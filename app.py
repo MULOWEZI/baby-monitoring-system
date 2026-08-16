@@ -8,6 +8,22 @@ import threading
 import logging
 from datetime import datetime
 
+# IMPORTANT:
+# This application runs under Gunicorn's geventwebsocket worker.
+# Patch gevent BEFORE importing requests, Supabase/httpx, or other
+# networking libraries. Late SSL/socket patching can cause recursive
+# networking failures such as:
+#   "maximum recursion depth exceeded"
+try:
+    from gevent import monkey
+    monkey.patch_all()
+except Exception as e:
+    # Keep local/non-gevent execution possible.
+    logging.getLogger(__name__).warning(
+        "gevent monkey patch could not be applied early: %s",
+        e
+    )
+
 import requests
 
 from flask import Flask, render_template, request, jsonify, Response
@@ -368,6 +384,10 @@ def send_alert_email(alerts):
             endpoint
         )
 
+        log.info(
+            "EMAIL: starting outbound Bird HTTP request"
+        )
+
         response = requests.post(
             endpoint,
             headers={
@@ -376,6 +396,10 @@ def send_alert_email(alerts):
             },
             json=payload,
             timeout=20
+        )
+
+        log.info(
+            "EMAIL: outbound Bird HTTP request completed"
         )
 
         response_text = response.text[:1000]
