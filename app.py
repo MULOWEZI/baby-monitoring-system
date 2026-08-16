@@ -41,6 +41,16 @@ HUMIDITY_MIN = float(os.getenv("HUMIDITY_MIN", 40))
 HUMIDITY_MAX = float(os.getenv("HUMIDITY_MAX", 60))
 DASHBOARD_PUSH_INTERVAL = float(os.getenv("DASHBOARD_PUSH_INTERVAL", 5))
 
+# Debounce: a reading must be abnormal for this many CONSECUTIVE ingests
+# before it's treated as a real state change. Filters single noisy/flickering
+# sensor readings so they don't fire an alert on their own.
+ALERT_DEBOUNCE_READINGS = int(os.getenv("ALERT_DEBOUNCE_READINGS", 3))
+
+# Cooldown: hard floor on how often an email can go out for the SAME alert
+# type, regardless of how the state flips. Protects against rapid toggling
+# and against Render restarts resetting in-memory state and re-firing.
+ALERT_EMAIL_COOLDOWN_SECONDS = float(os.getenv("ALERT_EMAIL_COOLDOWN_SECONDS", 300))
+
 BIRD_API_KEY = os.getenv("BIRD_API_KEY", "")
 BIRD_SENDER = os.getenv("BIRD_SENDER", "onboarding@messagebird.dev")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
@@ -84,8 +94,11 @@ _subscribers_lock = threading.Lock()
 _reading_queue = queue.Queue()
 
 alert_state_lock = threading.Lock()
-previous_wetness = False
-previous_temperature_abnormal = False
+previous_wetness = False               # debounced/confirmed state
+previous_temperature_abnormal = False  # debounced/confirmed state
+_wetness_streak = 0                    # consecutive readings disagreeing with confirmed state
+_temp_streak = 0
+_last_email_sent = {}                  # alert_type -> unix timestamp of last email sent
 
 
 def _broadcast_frame(frame):
@@ -161,6 +174,28 @@ def send_alert_email(alerts):
     return False
 
 
+def _apply_email_cooldown(alerts):
+    """
+    Drop alerts whose alert_type had an email sent within the last
+    ALERT_EMAIL_COOLDOWN_SECONDS. This is a hard rate-limit independent of
+    the debounce logic above — it also covers the case where the process
+    restarts (Render) and in-memory previous_* state resets to False,
+    which would otherwise let a still-active condition re-fire immediately.
+    """
+    now = time.time()
+    allowed = []
+    for alert in alerts:
+        alert_type = alert.get("alert_type")
+        last_sent = _last_email_sent.get(alert_type, 0)
+        if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
+            allowed.append(alert)
+            _last_email_sent[alert_type] = now
+        else:
+            remaining = int(ALERT_EMAIL_COOLDOWN_SECONDS - (now - last_sent))
+            log.info("Email for '%s' suppressed by cooldown (%ss remaining)", alert_type, remaining)
+    return allowed
+
+
 # ============================================================
 # THRESHOLD / ALERT LOGIC
 # ============================================================
@@ -174,42 +209,63 @@ def check_abnormal(temp, hum):
 
 def check_alerts(temp, hum, wetness, sound):
     """
-    Detect NEW alert events (edge-triggered, not level-triggered):
-      normal -> abnormal  = new event
+    Detect NEW alert events — debounced + edge-triggered:
+      normal -> abnormal  = new event, but only after the reading has been
+                             abnormal for ALERT_DEBOUNCE_READINGS consecutive
+                             ingests (filters a single noisy/flickering reading)
       abnormal -> abnormal = no new event
-      abnormal -> normal  = reset (silent)
-    Same principle for wetness.
+      abnormal -> normal  = reset, same debounce applies before it's confirmed
+    Same principle for wetness. Email sending on top of this is additionally
+    rate-limited by a cooldown (see send_alert_email call below).
     """
     global previous_wetness, previous_temperature_abnormal
+    global _wetness_streak, _temp_streak
 
-    temperature_abnormal = temp is not None and (temp < TEMP_MIN or temp > TEMP_MAX)
-    current_wetness = bool(wetness)
+    raw_temperature_abnormal = temp is not None and (temp < TEMP_MIN or temp > TEMP_MAX)
+    raw_wetness = bool(wetness)
     alerts = []
 
     with alert_state_lock:
-        if temperature_abnormal and not previous_temperature_abnormal:
-            if temp > TEMP_MAX:
-                message = f"🌡️ Temperature is too high: {temp}°C. Configured maximum is {TEMP_MAX}°C."
-            elif temp < TEMP_MIN:
-                message = f"🌡️ Temperature is too low: {temp}°C. Configured minimum is {TEMP_MIN}°C."
-            else:
-                message = f"🌡️ Abnormal temperature detected: {temp}°C."
-            alerts.append({"alert_type": "temperature", "severity": "critical", "message": message})
-        previous_temperature_abnormal = temperature_abnormal
+        # ---- temperature: debounce the raw reading against confirmed state ----
+        if raw_temperature_abnormal != previous_temperature_abnormal:
+            _temp_streak += 1
+        else:
+            _temp_streak = 0
 
-        if current_wetness and not previous_wetness:
-            alerts.append({
-                "alert_type": "wetness", "severity": "critical",
-                "message": "💧 Diaper is wet! Please change the diaper.",
-            })
-        previous_wetness = current_wetness
+        if _temp_streak >= ALERT_DEBOUNCE_READINGS:
+            # Confirmed real state change
+            if raw_temperature_abnormal:  # normal -> abnormal
+                if temp > TEMP_MAX:
+                    message = f"🌡️ Temperature is too high: {temp}°C. Configured maximum is {TEMP_MAX}°C."
+                elif temp < TEMP_MIN:
+                    message = f"🌡️ Temperature is too low: {temp}°C. Configured minimum is {TEMP_MIN}°C."
+                else:
+                    message = f"🌡️ Abnormal temperature detected: {temp}°C."
+                alerts.append({"alert_type": "temperature", "severity": "critical", "message": message})
+            previous_temperature_abnormal = raw_temperature_abnormal
+            _temp_streak = 0
+
+        # ---- wetness: same debounce pattern ----
+        if raw_wetness != previous_wetness:
+            _wetness_streak += 1
+        else:
+            _wetness_streak = 0
+
+        if _wetness_streak >= ALERT_DEBOUNCE_READINGS:
+            if raw_wetness:  # dry -> wet
+                alerts.append({
+                    "alert_type": "wetness", "severity": "critical",
+                    "message": "💧 Diaper is wet! Please change the diaper.",
+                })
+            previous_wetness = raw_wetness
+            _wetness_streak = 0
 
     if not alerts:
         return
 
     for alert in alerts:
         log.info("NEW ALERT: %s", alert["message"])
-        socketio.emit("new_alert", alert)  # always push to dashboard, DB or no DB
+        socketio.emit("new_alert", alert)  # dashboard always gets it, no cooldown
 
         if supabase is not None:
             try:
@@ -217,7 +273,7 @@ def check_alerts(temp, hum, wetness, sound):
             except Exception as e:
                 log.error("Supabase alert insert error: %s", e)
 
-    send_alert_email(alerts)
+    send_alert_email(_apply_email_cooldown(alerts))
 
 
 # ============================================================
