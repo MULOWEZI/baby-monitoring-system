@@ -154,27 +154,342 @@ def _broadcast_frame(frame):
 
 
 # ============================================================
+# ============================================================
 # EMAIL CONFIGURATION
 # ============================================================
 
-BIRD_API_KEY = os.getenv(
-    "BIRD_API_KEY",
-    ""
-)
-
+BIRD_API_KEY = os.getenv("BIRD_API_KEY", "").strip()
 BIRD_SENDER = os.getenv(
     "BIRD_SENDER",
     "onboarding@messagebird.dev"
-)
+).strip()
+ALERT_EMAIL = os.getenv("ALERT_EMAIL", "").strip()
 
-ALERT_EMAIL = os.getenv(
-    "ALERT_EMAIL",
-    ""
-)
+
+def bird_host():
+    """
+    Bird API region is encoded in the API key:
+        bk_us1_... -> https://us1.platform.bird.com
+        bk_eu1_... -> https://eu1.platform.bird.com
+
+    The host must match the key region.
+    """
+    if not BIRD_API_KEY:
+        return "https://us1.platform.bird.com"
+
+    parts = BIRD_API_KEY.split("_")
+
+    if len(parts) >= 2 and parts[0] == "bk" and parts[1]:
+        region = parts[1]
+    else:
+        region = "us1"
+
+    return f"https://{region}.platform.bird.com"
+
+
+def email_configuration_status():
+    """
+    Return safe email configuration diagnostics.
+    Never logs the actual API key.
+    """
+    return {
+        "bird_api_key_configured": bool(BIRD_API_KEY),
+        "bird_api_key_prefix": (
+            BIRD_API_KEY[:8] + "..."
+            if BIRD_API_KEY
+            else None
+        ),
+        "bird_host": bird_host(),
+        "bird_sender": BIRD_SENDER or None,
+        "alert_email_configured": bool(ALERT_EMAIL),
+        "alert_email": ALERT_EMAIL or None,
+    }
+
+
+# ============================================================
+# EMAIL DELIVERY
+# ============================================================
+
+def send_alert_email(alerts):
+    """
+    Send one transactional email for a newly detected alert event.
+
+    Bird returns 202 when the message has been accepted for
+    asynchronous delivery. That is treated as a successful send
+    request. Actual delivery can subsequently be checked in Bird.
+    """
+
+    if not alerts:
+        log.warning("EMAIL: no alerts supplied")
+        return False
+
+    # --------------------------------------------------------
+    # Validate configuration
+    # --------------------------------------------------------
+
+    if not BIRD_API_KEY:
+        log.error(
+            "EMAIL: BIRD_API_KEY is missing"
+        )
+        return False
+
+    if not BIRD_SENDER:
+        log.error(
+            "EMAIL: BIRD_SENDER is missing"
+        )
+        return False
+
+    if not ALERT_EMAIL:
+        log.error(
+            "EMAIL: ALERT_EMAIL is missing"
+        )
+        return False
+
+    host = bird_host()
+    endpoint = f"{host}/v1/email/messages"
+
+    log.info(
+        "EMAIL: preparing Bird send | host=%s | from=%s | to=%s",
+        host,
+        BIRD_SENDER,
+        ALERT_EMAIL
+    )
+
+    # --------------------------------------------------------
+    # Determine subject
+    # --------------------------------------------------------
+
+    alert_types = {
+        alert.get("alert_type")
+        for alert in alerts
+    }
+
+    if "wetness" in alert_types:
+        subject = "Wet Diaper Detected"
+    elif "temperature" in alert_types:
+        subject = "Temperature Alert"
+    else:
+        subject = "Baby Monitoring Alert"
+
+    # --------------------------------------------------------
+    # Build HTML + plain text
+    # --------------------------------------------------------
+
+    html_items = []
+    text_items = []
+
+    for alert in alerts:
+        severity = str(
+            alert.get("severity", "warning")
+        ).upper()
+
+        message = str(
+            alert.get("message", "")
+        )
+
+        html_items.append(
+            f"<li><strong>{severity}</strong> — {message}</li>"
+        )
+
+        text_items.append(
+            f"{severity} — {message}"
+        )
+
+    # Use Lusaka time for the email timestamp.
+    from zoneinfo import ZoneInfo
+
+    timestamp = datetime.now(
+        ZoneInfo("Africa/Lusaka")
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S CAT"
+    )
+
+    html = f"""
+    <!doctype html>
+    <html>
+      <body>
+        <h2>Baby Cradle Monitoring Alert</h2>
+
+        <p>
+          A new condition requiring attention was detected.
+        </p>
+
+        <p>
+          <strong>Time:</strong> {timestamp}
+        </p>
+
+        <ul>
+          {''.join(html_items)}
+        </ul>
+
+        <p>
+          Please check the baby monitoring dashboard.
+        </p>
+
+        <p>
+          <a href="https://baby-monitoring-system.onrender.com">
+            Open Baby Monitoring Dashboard
+          </a>
+        </p>
+      </body>
+    </html>
+    """
+
+    plain_text = (
+        "Baby Cradle Monitoring Alert\n\n"
+        "A new condition requiring attention was detected.\n\n"
+        f"Time: {timestamp}\n\n"
+        + "\n".join(text_items)
+        + "\n\nPlease check the baby monitoring dashboard.\n"
+    )
+
+    # --------------------------------------------------------
+    # Bird payload
+    # --------------------------------------------------------
+
+    payload = {
+        "from": BIRD_SENDER,
+        "to": [ALERT_EMAIL],
+        "subject": subject,
+        "html": html,
+        "text": plain_text,
+        # Alerts are transactional messages, not marketing.
+        "category": "transactional"
+    }
+
+    # --------------------------------------------------------
+    # Send
+    # --------------------------------------------------------
+
+    try:
+
+        log.info(
+            "EMAIL: POST %s",
+            endpoint
+        )
+
+        response = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {BIRD_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=20
+        )
+
+        response_text = response.text[:1000]
+
+        log.info(
+            "EMAIL: Bird response status=%s body=%s",
+            response.status_code,
+            response_text
+        )
+
+        if response.status_code == 202:
+
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
+
+            message_id = result.get("id")
+
+            log.info(
+                "EMAIL: accepted by Bird | message_id=%s | recipient=%s",
+                message_id,
+                ALERT_EMAIL
+            )
+
+            return True
+
+        # Bird documents field-validation failures as 422 and
+        # authentication failures as 401/403. Log them explicitly.
+        if response.status_code == 401:
+            log.error(
+                "EMAIL: Bird rejected the API key (401). "
+                "Check BIRD_API_KEY and its region."
+            )
+
+        elif response.status_code == 403:
+            log.error(
+                "EMAIL: Bird denied the API operation (403). "
+                "Check the API key permissions/scopes."
+            )
+
+        elif response.status_code == 421:
+            log.error(
+                "EMAIL: wrong Bird regional host (421). "
+                "Check the region encoded in BIRD_API_KEY."
+            )
+
+        elif response.status_code == 422:
+            log.error(
+                "EMAIL: Bird rejected the email request (422). "
+                "Check sender verification, recipient restrictions, "
+                "and payload fields."
+            )
+
+        elif response.status_code == 429:
+            log.error(
+                "EMAIL: Bird rate/usage limit reached (429)."
+            )
+
+        else:
+            log.error(
+                "EMAIL: Bird send failed with HTTP %s",
+                response.status_code
+            )
+
+    except requests.Timeout:
+        log.error(
+            "EMAIL: Bird request timed out after 20 seconds"
+        )
+
+    except requests.RequestException as e:
+        log.error(
+            "EMAIL: network error while contacting Bird: %s",
+            e
+        )
+
+    except Exception as e:
+        log.exception(
+            "EMAIL: unexpected email error: %s",
+            e
+        )
+
+    return False
+
+
+def send_alert_email_async(alerts):
+    """
+    Run email delivery outside the sensor request/alert logic so
+    a slow or failed email provider never blocks sensor ingestion.
+    """
+
+    try:
+        success = send_alert_email(alerts)
+
+        if success:
+            log.info(
+                "EMAIL: alert email processing completed successfully"
+            )
+        else:
+            log.error(
+                "EMAIL: alert email was NOT accepted by Bird"
+            )
+
+    except Exception as e:
+        log.exception(
+            "EMAIL: background worker failed: %s",
+            e
+        )
 
 
 # ============================================================
 # ALERT STATE
+# ============================================================
+
 #
 # These variables prevent repeated alerts while the SAME
 # condition remains active.
@@ -688,9 +1003,12 @@ def check_alerts(
     # SEND ONE EMAIL FOR THE NEW EVENT
     # ========================================================
 
-    send_alert_email(
-        alerts
-    )
+    # Do not block sensor processing while Bird is contacted.
+    threading.Thread(
+        target=send_alert_email_async,
+        args=(list(alerts),),
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -773,8 +1091,6 @@ def _process_reading_async(
         )
 
 
-# ============================================================
-# HOME PAGE
 # ============================================================
 # HOME PAGE
 # ============================================================
@@ -873,7 +1189,64 @@ def api_db_health():
 
 
 # ============================================================
-# SENSOR HISTORY
+# EMAIL CONFIGURATION / TEST
+# ============================================================
+
+@app.route(
+    "/api/email_status",
+    methods=["GET"]
+)
+def api_email_status():
+
+    """
+    Safe diagnostic endpoint. It reports configuration status
+    without exposing the Bird API key.
+    """
+
+    status = email_configuration_status()
+
+    return jsonify({
+        "status": "ok",
+        "email": status
+    }), 200
+
+
+@app.route(
+    "/api/test_email",
+    methods=["POST"]
+)
+def api_test_email():
+
+    """
+    Send a controlled test email without requiring a sensor alert.
+
+    This is intended for debugging the Bird configuration.
+    """
+
+    test_alert = [{
+        "alert_type": "test",
+        "severity": "warning",
+        "message": "This is a test email from the Baby Monitoring System."
+    }]
+
+    success = send_alert_email(
+        test_alert
+    )
+
+    if success:
+        return jsonify({
+            "status": "ok",
+            "message": "Bird accepted the test email",
+            "recipient": ALERT_EMAIL
+        }), 200
+
+    return jsonify({
+        "status": "error",
+        "message": "Bird did not accept the test email. Check Render logs.",
+        "configuration": email_configuration_status()
+    }), 502
+
+
 # ============================================================
 # SENSOR HISTORY
 # ============================================================
@@ -1160,8 +1533,6 @@ def api_ingest():
     }), 200
 
 
-# ============================================================
-# VIDEO FRAME UPLOAD
 # ============================================================
 # VIDEO FRAME UPLOAD
 # ============================================================
