@@ -12,6 +12,7 @@ import time
 import queue
 import threading
 import logging
+import hmac
 from datetime import datetime
 
 import requests
@@ -46,14 +47,17 @@ DASHBOARD_PUSH_INTERVAL = float(os.getenv("DASHBOARD_PUSH_INTERVAL", 5))
 # sensor readings so they don't fire an alert on their own.
 ALERT_DEBOUNCE_READINGS = int(os.getenv("ALERT_DEBOUNCE_READINGS", 2))
 
-# Cooldown: hard floor on how often an email can go out for the SAME alert
-# type, regardless of how the state flips. Protects against rapid toggling
-# and against Render restarts resetting in-memory state and re-firing.
-ALERT_EMAIL_COOLDOWN_SECONDS = float(os.getenv("ALERT_EMAIL_COOLDOWN_SECONDS", 180))
+# Email policy: one email for each confirmed event, with a 10-minute
+# safety cooldown. The event must recover before another email of the
+# same type can be generated.
+ALERT_EMAIL_COOLDOWN_SECONDS = float(
+    os.getenv("ALERT_EMAIL_COOLDOWN_SECONDS", 600)
+)
 
-BIRD_API_KEY = os.getenv("BIRD_API_KEY", "")
-BIRD_SENDER = os.getenv("BIRD_SENDER", "onboarding@messagebird.dev")
-ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
+BIRD_API_KEY = os.getenv("BIRD_API_KEY", "").strip()
+BIRD_SENDER = os.getenv("BIRD_SENDER", "onboarding@messagebird.dev").strip()
+ALERT_EMAIL = os.getenv("ALERT_EMAIL", "").strip()
+EMAIL_TEST_TOKEN = os.getenv("EMAIL_TEST_TOKEN", "").strip()
 
 # ============================================================
 # SUPABASE
@@ -98,7 +102,11 @@ previous_wetness = False               # debounced/confirmed state
 previous_temperature_abnormal = False  # debounced/confirmed state
 _wetness_streak = 0                    # consecutive readings disagreeing with confirmed state
 _temp_streak = 0
-_last_email_sent = {}                  # alert_type -> unix timestamp of last email sent
+_last_email_sent = {}                  # alert_type -> last successful email timestamp
+_email_alert_active = {
+    "temperature": False,
+    "wetness": False,
+}
 
 
 def _broadcast_frame(frame):
@@ -120,59 +128,257 @@ def _broadcast_frame(frame):
 # ============================================================
 # EMAIL ALERTS
 # ============================================================
+
 def bird_host():
+    """
+    Bird API keys contain their region:
+      bk_us1_... -> https://us1.platform.bird.com
+      bk_eu1_... -> https://eu1.platform.bird.com
+    """
+
     parts = BIRD_API_KEY.split("_")
-    region = parts[1] if len(parts) > 1 and parts[1] else "us1"
-    return f"https://{region}.platform.bird.com"
+
+    if len(parts) >= 2 and parts[0] == "bk" and parts[1]:
+        return f"https://{parts[1]}.platform.bird.com"
+
+    # Safe fallback. The normal production key should always contain
+    # the region in the bk_<region>_... format.
+    return "https://us1.platform.bird.com"
 
 
-def send_alert_email(alerts):
-    if not alerts or not BIRD_API_KEY or not ALERT_EMAIL:
-        if alerts and not BIRD_API_KEY:
-            log.warning("BIRD_API_KEY not set — skipping email notification")
-        if alerts and not ALERT_EMAIL:
-            log.warning("ALERT_EMAIL not set — skipping email notification")
+def _validate_email_config():
+    """Log configuration status without exposing secrets."""
+
+    if not BIRD_API_KEY:
+        log.error("EMAIL CONFIG ERROR: BIRD_API_KEY is missing")
+
+    else:
+        masked = (
+            BIRD_API_KEY[:8] + "..." + BIRD_API_KEY[-4:]
+            if len(BIRD_API_KEY) > 12
+            else "***"
+        )
+        log.info(
+            "Bird API key configured: %s | host=%s",
+            masked,
+            bird_host()
+        )
+
+    if not ALERT_EMAIL:
+        log.error("EMAIL CONFIG ERROR: ALERT_EMAIL is missing")
+    else:
+        log.info(
+            "Alert recipient configured: %s",
+            ALERT_EMAIL
+        )
+
+    log.info(
+        "Bird sender configured: %s",
+        BIRD_SENDER
+    )
+
+
+def send_alert_email(alerts, recipient=None):
+    """
+    Send an email through Bird.
+
+    Returns:
+        True  = Bird accepted the message (HTTP 202/200)
+        False = Bird rejected it or configuration is missing
+
+    The cooldown timestamp is deliberately NOT updated here. The caller
+    updates it only after this function returns True.
+    """
+
+    if not alerts:
+        log.warning("EMAIL SKIPPED: no alerts supplied")
         return False
 
-    alert_types = {a.get("alert_type") for a in alerts}
+    to_email = (recipient or ALERT_EMAIL).strip()
+
+    if not BIRD_API_KEY:
+        log.error(
+            "EMAIL NOT SENT: BIRD_API_KEY is not configured"
+        )
+        return False
+
+    if not to_email:
+        log.error(
+            "EMAIL NOT SENT: ALERT_EMAIL is not configured"
+        )
+        return False
+
+    alert_types = {
+        a.get("alert_type")
+        for a in alerts
+    }
+
     if "wetness" in alert_types:
-        subject = "💧 Wet Diaper Detected"
+        subject = "Wet Diaper Detected"
     elif "temperature" in alert_types:
-        subject = "🌡️ Temperature Alert"
+        subject = "Temperature Alert"
     else:
-        subject = "🚼 Baby Monitoring Alert"
+        subject = "Baby Monitoring Alert"
 
     items = "".join(
-        f"<li><strong>{a.get('severity', 'warning').upper()}</strong> — {a.get('message', '')}</li>"
+        f"<li><strong>{a.get('severity', 'warning').upper()}</strong> "
+        f"— {a.get('message', '')}</li>"
         for a in alerts
     )
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
     html = f"""
-    <html><body>
-        <h2>🚼 Baby Cradle Monitoring Alert</h2>
+    <html>
+      <body>
+        <h2>Baby Cradle Monitoring Alert</h2>
         <p>A new condition requiring attention was detected.</p>
         <p><strong>Time:</strong> {timestamp}</p>
         <ul>{items}</ul>
         <p>Please check the baby monitoring dashboard.</p>
-        <p><a href="https://baby-monitoring-system.onrender.com">Open Baby Monitoring Dashboard</a></p>
-    </body></html>
+        <p>
+          <a href="https://baby-monitoring-system.onrender.com">
+            Open Baby Monitoring Dashboard
+          </a>
+        </p>
+      </body>
+    </html>
     """
-    payload = {"from": BIRD_SENDER, "to": [ALERT_EMAIL], "subject": subject, "html": html}
+
+    text_body = (
+        "Baby Cradle Monitoring Alert\n\n"
+        f"Time: {timestamp}\n\n"
+        + "\n".join(
+            f"- {a.get('message', '')}"
+            for a in alerts
+        )
+        + "\n\nOpen the dashboard: "
+        "https://baby-monitoring-system.onrender.com"
+    )
+
+    payload = {
+        "from": BIRD_SENDER,
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+        "text": text_body,
+        # Alerts are operational/transactional messages.
+        "category": "transactional",
+    }
+
+    url = f"{bird_host()}/v1/email/messages"
+
+    log.warning(
+        "BIRD EMAIL ATTEMPT: host=%s sender=%s recipient=%s",
+        bird_host(),
+        BIRD_SENDER,
+        to_email
+    )
 
     try:
-        response = requests.post(
-            f"{bird_host()}/v1/email/messages",
-            headers={"Authorization": f"Bearer {BIRD_API_KEY}", "Content-Type": "application/json"},
-            json=payload, timeout=15,
-        )
-        if response.status_code in (200, 202):
-            log.info("Alert email sent to %s (%s)", ALERT_EMAIL, response.status_code)
-            return True
-        log.error("Bird email failed %s: %s", response.status_code, response.text[:300])
-    except Exception as e:
-        log.error("Bird email exception: %s", e)
-    return False
 
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {BIRD_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=20,
+        )
+
+        log.warning(
+            "BIRD RESPONSE: status=%s body=%s",
+            response.status_code,
+            response.text[:1000]
+        )
+
+        if response.status_code in (200, 202):
+
+            try:
+                body = response.json()
+                message_id = body.get("id")
+                status = body.get("status")
+            except Exception:
+                message_id = None
+                status = None
+
+            log.warning(
+                "BIRD EMAIL ACCEPTED: message_id=%s status=%s",
+                message_id,
+                status
+            )
+
+            return True
+
+        log.error(
+            "BIRD EMAIL REJECTED: HTTP %s",
+            response.status_code
+        )
+
+        return False
+
+    except requests.RequestException as e:
+
+        log.exception(
+            "BIRD EMAIL NETWORK ERROR: %s",
+            e
+        )
+
+        return False
+
+    except Exception as e:
+
+        log.exception(
+            "BIRD EMAIL UNEXPECTED ERROR: %s",
+            e
+        )
+
+        return False
+
+
+def _send_email_background(alerts, alert_types=None):
+    """
+    Send the email outside the sensor worker.
+
+    The last-email timestamp is updated ONLY when Bird accepts the
+    request. This means a failed send does not consume the cooldown.
+    """
+
+    log.warning(
+        "EMAIL WORKER STARTED: %s",
+        [a.get("alert_type") for a in alerts]
+    )
+
+    success = send_alert_email(alerts)
+
+    if success:
+
+        now = time.time()
+
+        with alert_state_lock:
+
+            for alert in alerts:
+
+                alert_type = alert.get("alert_type")
+
+                if alert_type:
+                    _last_email_sent[alert_type] = now
+
+        log.warning(
+            "EMAIL DELIVERY HANDOFF SUCCESSFUL"
+        )
+
+    else:
+
+        log.error(
+            "EMAIL DELIVERY HANDOFF FAILED — cooldown was NOT consumed"
+        )
+
+
+_validate_email_config()
 
 # ============================================================
 # THRESHOLD / ALERT LOGIC
@@ -187,84 +393,193 @@ def check_abnormal(temp, hum):
 
 def check_alerts(temp, hum, wetness, sound):
     """
-    Alerting model:
-      - A state change (normal->abnormal or abnormal->normal) is only
-        confirmed after ALERT_DEBOUNCE_READINGS consecutive raw readings
-        agree — filters a single noisy/flickering reading.
-      - Once confirmed abnormal, an alert fires immediately, then fires
-        again every ALERT_EMAIL_COOLDOWN_SECONDS for as long as the
-        condition remains abnormal (a repeating reminder, not one-and-done).
-      - The cooldown is a strict timer with no early reset: even if the
-        condition briefly recovers and re-triggers (sensor noise around
-        the threshold), the next alert still waits out the full cooldown
-        from the last one sent, so boundary jitter can't cause rapid-fire
-        emails.
-    Same logic applies independently to temperature and wetness.
+    Alert logic:
+
+      - A state transition must be confirmed by two consecutive readings.
+      - One email is generated when a NEW abnormal event starts.
+      - No repeated email while the event remains active.
+      - Recovery resets the event.
+      - A later event can generate a new email.
+      - A 10-minute safety cooldown protects against rapid oscillation.
     """
+
     global previous_wetness, previous_temperature_abnormal
     global _wetness_streak, _temp_streak
 
-    raw_temperature_abnormal = temp is not None and (temp < TEMP_MIN or temp > TEMP_MAX)
+    raw_temperature_abnormal = (
+        temp is not None
+        and (temp < TEMP_MIN or temp > TEMP_MAX)
+    )
+
     raw_wetness = bool(wetness)
+
     alerts = []
     now = time.time()
 
     with alert_state_lock:
-        # ---- temperature: debounce raw reading against confirmed state ----
-        if raw_temperature_abnormal != previous_temperature_abnormal:
+
+        # --------------------------------------------------------
+        # TEMPERATURE
+        # --------------------------------------------------------
+
+        old_temperature_state = previous_temperature_abnormal
+
+        if raw_temperature_abnormal != old_temperature_state:
             _temp_streak += 1
         else:
             _temp_streak = 0
 
         if _temp_streak >= ALERT_DEBOUNCE_READINGS:
+
             previous_temperature_abnormal = raw_temperature_abnormal
             _temp_streak = 0
 
-        if previous_temperature_abnormal:
-            last_sent = _last_email_sent.get("temperature", 0)
-            if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
-                if temp > TEMP_MAX:
-                    message = f"🌡️ Temperature is too high: {temp}°C. Configured maximum is {TEMP_MAX}°C."
-                elif temp < TEMP_MIN:
-                    message = f"🌡️ Temperature is too low: {temp}°C. Configured minimum is {TEMP_MIN}°C."
-                else:
-                    message = f"🌡️ Abnormal temperature detected: {temp}°C."
-                alerts.append({"alert_type": "temperature", "severity": "critical", "message": message})
-                _last_email_sent["temperature"] = now
+            # NEW abnormal event only.
+            if (
+                not old_temperature_state
+                and raw_temperature_abnormal
+            ):
 
-        # ---- wetness: same debounce + repeat pattern ----
-        if raw_wetness != previous_wetness:
+                last_sent = _last_email_sent.get(
+                    "temperature",
+                    0
+                )
+
+                if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
+
+                    if temp > TEMP_MAX:
+                        message = (
+                            f"Temperature is too high: {temp}°C. "
+                            f"Configured maximum is {TEMP_MAX}°C."
+                        )
+
+                    else:
+                        message = (
+                            f"Temperature is too low: {temp}°C. "
+                            f"Configured minimum is {TEMP_MIN}°C."
+                        )
+
+                    alerts.append({
+                        "alert_type": "temperature",
+                        "severity": "critical",
+                        "message": message,
+                    })
+
+                    log.warning(
+                        "NEW TEMPERATURE EVENT CONFIRMED: %s",
+                        message
+                    )
+
+                else:
+
+                    log.warning(
+                        "Temperature event confirmed but safety "
+                        "cooldown is active."
+                    )
+
+            elif (
+                old_temperature_state
+                and not raw_temperature_abnormal
+            ):
+
+                log.info(
+                    "Temperature recovered."
+                )
+
+        # --------------------------------------------------------
+        # WETNESS
+        # --------------------------------------------------------
+
+        old_wetness_state = previous_wetness
+
+        if raw_wetness != old_wetness_state:
             _wetness_streak += 1
         else:
             _wetness_streak = 0
 
         if _wetness_streak >= ALERT_DEBOUNCE_READINGS:
+
             previous_wetness = raw_wetness
             _wetness_streak = 0
 
-        if previous_wetness:
-            last_sent = _last_email_sent.get("wetness", 0)
-            if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
-                alerts.append({
-                    "alert_type": "wetness", "severity": "critical",
-                    "message": "💧 Diaper is wet! Please change the diaper.",
-                })
-                _last_email_sent["wetness"] = now
+            # NEW wetness event only.
+            if not old_wetness_state and raw_wetness:
+
+                last_sent = _last_email_sent.get(
+                    "wetness",
+                    0
+                )
+
+                if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
+
+                    alerts.append({
+                        "alert_type": "wetness",
+                        "severity": "critical",
+                        "message": (
+                            "Diaper is wet! "
+                            "Please change the diaper."
+                        ),
+                    })
+
+                    log.warning(
+                        "NEW WETNESS EVENT CONFIRMED"
+                    )
+
+                else:
+
+                    log.warning(
+                        "Wetness event confirmed but safety "
+                        "cooldown is active."
+                    )
+
+            elif old_wetness_state and not raw_wetness:
+
+                log.info(
+                    "Wetness recovered."
+                )
 
     if not alerts:
         return
 
+    # Dashboard + Supabase alert record.
     for alert in alerts:
-        log.info("NEW ALERT: %s", alert["message"])
-        socketio.emit("new_alert", alert)
+
+        log.warning(
+            "NEW ALERT: %s",
+            alert["message"]
+        )
+
+        socketio.emit(
+            "new_alert",
+            alert
+        )
 
         if supabase is not None:
-            try:
-                supabase.table("alerts").insert(alert).execute()
-            except Exception as e:
-                log.error("Supabase alert insert error: %s", e)
 
-    send_alert_email(alerts)
+            try:
+
+                supabase.table(
+                    "alerts"
+                ).insert(
+                    alert
+                ).execute()
+
+            except Exception as e:
+
+                log.error(
+                    "Supabase alert insert error: %s",
+                    e
+                )
+
+    # Flask-SocketIO/gevent-compatible background task.
+    socketio.start_background_task(
+        _send_email_background,
+        alerts
+    )
+
+    log.warning(
+        "EMAIL QUEUED FOR ALERT EVENT"
+    )
 
 
 # ============================================================
@@ -375,6 +690,120 @@ def clear_alerts():
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# EMAIL TEST
+# ============================================================
+
+@app.route("/api/test-email", methods=["POST"])
+def api_test_email():
+
+    """
+    Test Bird directly from Render.
+
+    Render environment variable required:
+        EMAIL_TEST_TOKEN=<your secret>
+
+    Header:
+        X-Email-Test-Token: <your secret>
+
+    Optional JSON:
+        {"recipient": "delivered@messagebird.dev"}
+
+    The Bird sandbox recipient delivered@messagebird.dev is useful
+    for proving that the API pipeline works without depending on
+    the user's mailbox.
+    """
+
+    if not EMAIL_TEST_TOKEN:
+
+        log.error(
+            "TEST EMAIL DISABLED: EMAIL_TEST_TOKEN is not configured"
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "EMAIL_TEST_TOKEN is not configured on Render."
+        }), 503
+
+    supplied_token = request.headers.get(
+        "X-Email-Test-Token",
+        ""
+    )
+
+    if not hmac.compare_digest(
+        supplied_token,
+        EMAIL_TEST_TOKEN
+    ):
+
+        return jsonify({
+            "ok": False,
+            "error": "Unauthorized."
+        }), 401
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    recipient = (
+        data.get("recipient")
+        or ALERT_EMAIL
+    ).strip()
+
+    if not recipient:
+
+        return jsonify({
+            "ok": False,
+            "error": "No recipient configured."
+        }), 400
+
+    test_alert = [{
+        "alert_type": "test",
+        "severity": "info",
+        "message": "Baby Monitor email test from Render."
+    }]
+
+    socketio.start_background_task(
+        _test_email_background,
+        test_alert,
+        recipient
+    )
+
+    log.warning(
+        "TEST EMAIL QUEUED: recipient=%s",
+        recipient
+    )
+
+    return jsonify({
+        "ok": True,
+        "message": "Test email queued. Check Render logs."
+    }), 202
+
+
+def _test_email_background(alerts, recipient):
+
+    log.warning(
+        "TEST EMAIL WORKER STARTED: recipient=%s",
+        recipient
+    )
+
+    success = send_alert_email(
+        alerts,
+        recipient=recipient
+    )
+
+    if success:
+
+        log.warning(
+            "TEST EMAIL ACCEPTED BY BIRD"
+        )
+
+    else:
+
+        log.error(
+            "TEST EMAIL FAILED"
+        )
 
 
 # ============================================================
@@ -537,5 +966,9 @@ socketio.start_background_task(_dashboard_broadcaster)
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     debug = os.getenv("RENDER") is None
-    log.info("Baby Cradle Monitoring Server starting on port %s...", port)
+    log.info(
+        "Baby Cradle Monitoring Server starting on port %s...",
+        port
+    )
+    _validate_email_config()
     socketio.run(app, host="0.0.0.0", port=port, debug=debug, allow_unsafe_werkzeug=True)
