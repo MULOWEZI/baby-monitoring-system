@@ -1,1018 +1,799 @@
-#!/usr/bin/env python3
-
-Must run before ANY other import — requests/supabase/ssl/socket/threading
-
-all need to be patched before they're first imported, or gevent silently
-
-mixes patched and unpatched networking primitives (no exception raised,
-
-calls just vanish). This must stay the first code in the file.
-
-from gevent import monkey
-monkey.patch_all()
-
-import os
-import sys
-import time
-import queue
-import threading
-import logging
-import hmac
-from datetime import datetime
-
-import requests
-from flask import Flask, render_template, request, jsonify, Response
-from flask_socketio import SocketIO
-from dotenv import load_dotenv
-
-============================================================
-
-SETUP
-
-============================================================
-
-logging.basicConfig(level=logging.INFO, stream=sys.stdout,
-format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(name)
-
-load_dotenv()
-
-app = Flask(name)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "baby-monitor-secret-key")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
-
-============================================================
-
-CONFIG (read once, not per-request)
-
-============================================================
-
-TEMP_MIN = float(os.getenv("TEMP_MIN", 20))
-TEMP_MAX = float(os.getenv("TEMP_MAX", 25))
-HUMIDITY_MIN = float(os.getenv("HUMIDITY_MIN", 40))
-HUMIDITY_MAX = float(os.getenv("HUMIDITY_MAX", 60))
-DASHBOARD_PUSH_INTERVAL = float(os.getenv("DASHBOARD_PUSH_INTERVAL", 5))
-
-Debounce: a reading must be abnormal for this many CONSECUTIVE ingests
-
-before it's treated as a real state change. Filters single noisy/flickering
-
-sensor readings so they don't fire an alert on their own.
-
-ALERT_DEBOUNCE_READINGS = int(os.getenv("ALERT_DEBOUNCE_READINGS", 2))
-
-Email policy: one email for each confirmed event, with a 10-minute
-
-safety cooldown. The event must recover before another email of the
-
-same type can be generated.
-
-ALERT_EMAIL_COOLDOWN_SECONDS = float(
-os.getenv("ALERT_EMAIL_COOLDOWN_SECONDS", 600)
-)
-
-BIRD_API_KEY = os.getenv("BIRD_API_KEY", "").strip()
-BIRD_SENDER = os.getenv("BIRD_SENDER", "onboarding@messagebird.dev").strip()
-ALERT_EMAIL = os.getenv("ALERT_EMAIL", "").strip()
-EMAIL_TEST_TOKEN = os.getenv("EMAIL_TEST_TOKEN", "").strip()
-
-============================================================
-
-SUPABASE
-
-============================================================
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-supabase = None
-
-if SUPABASE_URL and SUPABASE_KEY:
-try:
-from supabase import create_client
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-log.info("Supabase client connected: %s...", SUPABASE_URL[:30])
-except Exception as e:
-log.warning("Supabase initialization failed: %s", e)
-else:
-log.warning("SUPABASE_URL/KEY not set — running without database")
-
-============================================================
-
-SHARED STATE
-
-============================================================
-
-current_data = {
-"temperature": 0, "humidity": 0, "motion": False,
-"sound": 0, "wetness": False, "last_update": None,
-}
-_data_lock = threading.Lock()
-_last_broadcast_update = None  # tracks last_update value already pushed to dashboard
-
-Video: latest frame + live subscriber queues (unchanged — this stays event-driven)
-
-latest_frame = None
-_frame_lock = threading.Lock()
-_frame_subscribers = []
-_subscribers_lock = threading.Lock()
-
-Reading processing: single worker consumes a queue instead of spawning
-
-a new thread per ingest call, so alerts/DB writes stay immediate without
-
-risking thread explosion under high-frequency sensor posts.
-
-_reading_queue = queue.Queue()
-
-alert_state_lock = threading.Lock()
-previous_wetness = False               # debounced/confirmed state
-previous_temperature_abnormal = False  # debounced/confirmed state
-_wetness_streak = 0                    # consecutive readings disagreeing with confirmed state
-_temp_streak = 0
-_last_email_sent = {}                  # alert_type -> last successful email timestamp
-_email_alert_active = {
-"temperature": False,
-"wetness": False,
-}
-
-def _broadcast_frame(frame):
-with _subscribers_lock:
-for q in _frame_subscribers:
-try:
-q.put_nowait(frame)
-except queue.Full:
-try:
-q.get_nowait()
-except queue.Empty:
-pass
-try:
-q.put_nowait(frame)
-except queue.Full:
-pass
-
-============================================================
-
-EMAIL ALERTS
-
-============================================================
-
-def bird_host():
-"""
-Bird API keys contain their region:
-bk_us1_... -> https://us1.platform.bird.com
-bk_eu1_... -> https://eu1.platform.bird.com
-"""
-
-parts = BIRD_API_KEY.split("_")
-
-if len(parts) >= 2 and parts[0] == "bk" and parts[1]:
-    return f"https://{parts[1]}.platform.bird.com"
-
-# Safe fallback. The normal production key should always contain
-# the region in the bk_<region>_... format.
-return "https://us1.platform.bird.com"
-
-def _validate_email_config():
-"""Log configuration status without exposing secrets."""
-
-if not BIRD_API_KEY:
-    log.error("EMAIL CONFIG ERROR: BIRD_API_KEY is missing")
-
-else:
-    masked = (
-        BIRD_API_KEY[:8] + "..." + BIRD_API_KEY[-4:]
-        if len(BIRD_API_KEY) > 12
-        else "***"
-    )
-    log.info(
-        "Bird API key configured: %s | host=%s",
-        masked,
-        bird_host()
-    )
-
-if not ALERT_EMAIL:
-    log.error("EMAIL CONFIG ERROR: ALERT_EMAIL is missing")
-else:
-    log.info(
-        "Alert recipient configured: %s",
-        ALERT_EMAIL
-    )
-
-log.info(
-    "Bird sender configured: %s",
-    BIRD_SENDER
-)
-
-def send_alert_email(alerts, recipient=None):
-"""
-Send an email through Bird.
-
-Returns:
-    True  = Bird accepted the message (HTTP 202/200)
-    False = Bird rejected it or configuration is missing
-
-The cooldown timestamp is deliberately NOT updated here. The caller
-updates it only after this function returns True.
-"""
-
-if not alerts:
-    log.warning("EMAIL SKIPPED: no alerts supplied")
-    return False
-
-to_email = (recipient or ALERT_EMAIL).strip()
-
-if not BIRD_API_KEY:
-    log.error(
-        "EMAIL NOT SENT: BIRD_API_KEY is not configured"
-    )
-    return False
-
-if not to_email:
-    log.error(
-        "EMAIL NOT SENT: ALERT_EMAIL is not configured"
-    )
-    return False
-
-alert_types = {
-    a.get("alert_type")
-    for a in alerts
-}
-
-if "wetness" in alert_types:
-    subject = "Wet Diaper Detected"
-elif "temperature" in alert_types:
-    subject = "Temperature Alert"
-else:
-    subject = "Baby Monitoring Alert"
-
-items = "".join(
-    f"<li><strong>{a.get('severity', 'warning').upper()}</strong> "
-    f"— {a.get('message', '')}</li>"
-    for a in alerts
-)
-
-timestamp = datetime.now().strftime(
-    "%Y-%m-%d %H:%M:%S"
-)
-
-html = f"""
-<html>
-  <body>
-    <h2>Baby Cradle Monitoring Alert</h2>
-    <p>A new condition requiring attention was detected.</p>
-    <p><strong>Time:</strong> {timestamp}</p>
-    <ul>{items}</ul>
-    <p>Please check the baby monitoring dashboard.</p>
-    <p>
-      <a href="https://baby-monitoring-system.onrender.com">
-        Open Baby Monitoring Dashboard
-      </a>
-    </p>
-  </body>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Baby Cradle Monitoring System - Live Video</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #f0f6ff;
+            --bg-secondary: #ffffff;
+            --bg-card: rgba(255, 255, 255, 0.7);
+            --card-border: rgba(0, 20, 60, 0.06);
+            --text-primary: #0a1a3a;
+            --text-secondary: #1a3a6a;
+            --text-muted: #5a7a9a;
+            --accent-1: #2563eb;
+            --accent-2: #3b82f6;
+            --accent-3: #60a5fa;
+            --gradient-main: linear-gradient(135deg, #2563eb, #3b82f6, #60a5fa);
+            --gradient-glow: linear-gradient(135deg, rgba(37, 99, 235, 0.10), rgba(96, 165, 250, 0.06));
+            --danger: #ef4444;
+            --danger-bg: rgba(239, 68, 68, 0.08);
+            --warn: #f59e0b;
+            --warn-bg: rgba(245, 158, 11, 0.08);
+            --success: #22c55e;
+            --success-bg: rgba(34, 197, 94, 0.08);
+            --border-radius: 16px;
+            --border-radius-sm: 10px;
+            --shadow-card: 0 4px 20px rgba(37, 99, 235, 0.06);
+            --shadow-hover: 0 8px 40px rgba(37, 99, 235, 0.10);
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            --sidebar-width: 230px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            overflow-x: hidden;
+        }
+
+        /* Subtle background pattern */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                radial-gradient(circle at 15% 50%, rgba(37, 99, 235, 0.04) 0%, transparent 50%),
+                radial-gradient(circle at 85% 20%, rgba(59, 130, 246, 0.04) 0%, transparent 50%),
+                radial-gradient(circle at 50% 80%, rgba(96, 165, 250, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* ===== SIDEBAR ===== */
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: var(--sidebar-width);
+            height: 100vh;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--card-border);
+            padding: 20px 14px;
+            display: flex;
+            flex-direction: column;
+            z-index: 100;
+            box-shadow: 2px 0 24px rgba(37, 99, 235, 0.04);
+            transition: var(--transition);
+            overflow-y: auto;
+        }
+
+        .sidebar-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding-bottom: 18px;
+            border-bottom: 1px solid var(--card-border);
+            margin-bottom: 18px;
+        }
+
+        .sidebar-brand .logo {
+            width: 40px;
+            height: 40px;
+            border-radius: var(--border-radius-sm);
+            display: grid;
+            place-items: center;
+            background: var(--gradient-main);
+            font-size: 1.2rem;
+            box-shadow: 0 4px 14px rgba(37, 99, 235, 0.25);
+            flex-shrink: 0;
+            transition: var(--transition);
+        }
+
+        .sidebar-brand .logo:hover {
+            transform: scale(1.05) rotate(-5deg);
+            box-shadow: 0 6px 20px rgba(37, 99, 235, 0.35);
+        }
+
+        .sidebar-brand .brand-text h2 {
+            font-size: 0.95rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+            line-height: 1.2;
+        }
+
+        .sidebar-brand .brand-text small {
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.55rem;
+            font-weight: 500;
+            letter-spacing: 0.3px;
+        }
+
+        .sidebar-nav {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            flex: 1;
+        }
+
+        .sidebar-nav a.link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 9px 12px;
+            border-radius: var(--border-radius-sm);
+            font-weight: 600;
+            font-size: 0.8rem;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .sidebar-nav a.link i {
+            width: 18px;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            transition: var(--transition);
+        }
+
+        .sidebar-nav a.link:hover {
+            color: var(--text-primary);
+            background: rgba(37, 99, 235, 0.06);
+        }
+
+        .sidebar-nav a.link:hover i {
+            color: var(--accent-1);
+        }
+
+        .sidebar-nav a.link.active {
+            background: var(--gradient-main);
+            color: #fff;
+            box-shadow: 0 4px 16px rgba(37, 99, 235, 0.25);
+        }
+
+        .sidebar-nav a.link.active i {
+            color: #fff;
+        }
+
+        .sidebar-footer {
+            border-top: 1px solid var(--card-border);
+            padding-top: 14px;
+            margin-top: auto;
+        }
+
+        .sidebar-footer .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.65rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            padding: 4px 0;
+        }
+
+        .sidebar-footer .status-indicator .dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse-dot 2s infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .sidebar-footer .version {
+            font-size: 0.55rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* ===== MAIN CONTENT ===== */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            flex: 1;
+            padding: 20px 24px 26px;
+            min-height: 100vh;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* ===== TOP BAR ===== */
+        .top-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .top-bar .page-title h1 {
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: var(--text-primary);
+        }
+
+        .top-bar .page-title p {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 1px;
+        }
+
+        .top-bar .live-chip {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.65rem;
+            font-weight: 700;
+            color: var(--danger);
+            background: var(--danger-bg);
+            border: 1px solid rgba(239, 68, 68, 0.15);
+            padding: 6px 14px 6px 12px;
+            border-radius: 30px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .top-bar .live-chip .pulse-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--danger);
+            animation: pulse 1.8s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+
+        /* ===== MAIN GRID ===== */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 2.2fr 1fr;
+            gap: 20px;
+        }
+
+        /* ===== VIDEO PANEL ===== */
+        .video-panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--card-border);
+            border-radius: var(--border-radius);
+            overflow: hidden;
+            box-shadow: var(--shadow-card);
+            transition: var(--transition);
+        }
+
+        .video-panel:hover {
+            box-shadow: var(--shadow-hover);
+            border-color: rgba(37, 99, 235, 0.10);
+        }
+
+        .video-container {
+            position: relative;
+            background: #0a1628;
+            aspect-ratio: 4/3;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .video-container img {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: contain;
+        }
+
+        .video-placeholder {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            color: var(--text-muted);
+            background: #0a1628;
+        }
+
+        .video-placeholder .big {
+            font-size: 3.2rem;
+            opacity: 0.4;
+        }
+
+        .video-placeholder span {
+            font-weight: 500;
+            font-size: 0.85rem;
+            letter-spacing: 0.3px;
+        }
+
+        .video-placeholder .spinner {
+            width: 30px;
+            height: 30px;
+            border: 2px solid rgba(255, 255, 255, 0.05);
+            border-top-color: var(--accent-1);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* REC badge */
+        .rec-chip {
+            position: absolute;
+            top: 14px;
+            left: 16px;
+            z-index: 5;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(8px);
+            color: #f87171;
+            font-size: 0.6rem;
+            font-weight: 700;
+            letter-spacing: 0.8px;
+            padding: 5px 12px 5px 10px;
+            border-radius: 30px;
+            border: 1px solid rgba(239, 68, 68, 0.15);
+        }
+
+        .rec-chip .rec-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #ef4444;
+            animation: blink 1.2s infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.15; }
+        }
+
+        /* ===== INFO PANEL ===== */
+        .info-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .info-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--card-border);
+            border-radius: var(--border-radius-sm);
+            padding: 14px 16px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            transition: var(--transition);
+            cursor: default;
+            box-shadow: var(--shadow-card);
+        }
+
+        .info-card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(37, 99, 235, 0.10);
+            box-shadow: var(--shadow-hover);
+        }
+
+        .info-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: var(--border-radius-sm);
+            display: grid;
+            place-items: center;
+            font-size: 1.1rem;
+            background: var(--gradient-glow);
+            flex-shrink: 0;
+            transition: var(--transition);
+        }
+
+        .info-card:hover .info-icon {
+            transform: scale(1.05);
+            background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(96, 165, 250, 0.06));
+        }
+
+        .info-meta {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .info-label {
+            font-size: 0.55rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            font-weight: 700;
+        }
+
+        .info-value {
+            font-size: 1.2rem;
+            font-weight: 800;
+            margin-top: 1px;
+            letter-spacing: -0.01em;
+            color: var(--text-primary);
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 12px;
+            border-radius: 30px;
+            font-size: 0.55rem;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            flex-shrink: 0;
+            transition: var(--transition);
+        }
+
+        .status-badge.normal {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+
+        .status-badge.warning {
+            background: var(--warn-bg);
+            color: var(--warn);
+        }
+
+        .status-badge.critical {
+            background: var(--danger-bg);
+            color: var(--danger);
+        }
+
+        /* ===== FOOTER ===== */
+        .footer {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.65rem;
+            padding: 16px 0 4px;
+            border-top: 1px solid var(--card-border);
+            margin-top: 20px;
+            letter-spacing: 0.3px;
+        }
+
+        .footer span {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        /* ===== RESPONSIVE ===== */
+        @media (max-width: 992px) {
+            :root {
+                --sidebar-width: 0px;
+            }
+
+            .sidebar {
+                transform: translateX(-100%);
+                width: 270px;
+                box-shadow: 4px 0 40px rgba(0, 0, 0, 0.08);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .main-content {
+                margin-left: 0;
+                padding: 14px 16px 20px;
+            }
+
+            .hamburger {
+                display: flex !important;
+            }
+
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .video-container {
+                aspect-ratio: 16/9;
+                max-height: 400px;
+            }
+        }
+
+        .hamburger {
+            display: none;
+            background: none;
+            border: none;
+            font-size: 1.3rem;
+            color: var(--text-primary);
+            cursor: pointer;
+            padding: 5px;
+            border-radius: 8px;
+            transition: var(--transition);
+        }
+
+        .hamburger:hover {
+            background: rgba(37, 99, 235, 0.06);
+        }
+
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.25);
+            z-index: 99;
+            backdrop-filter: blur(4px);
+        }
+
+        .sidebar-overlay.active {
+            display: block;
+        }
+
+        @media (max-width: 480px) {
+            .top-bar .page-title h1 {
+                font-size: 1rem;
+            }
+
+            .info-card {
+                padding: 12px 12px;
+                gap: 10px;
+            }
+
+            .info-icon {
+                width: 34px;
+                height: 34px;
+                font-size: 0.9rem;
+            }
+
+            .info-value {
+                font-size: 1rem;
+            }
+
+            .video-container {
+                max-height: 280px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ===== SIDEBAR ===== -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-brand">
+            <div class="logo">🚼</div>
+            <div class="brand-text">
+                <h2>Baby Cradle</h2>
+                <small>Smart Monitoring</small>
+            </div>
+        </div>
+
+        <nav class="sidebar-nav">
+            <a href="/" class="link">
+                <i>📊</i> Dashboard
+            </a>
+            <a href="/live" class="link active">
+                <i>📷</i> Live Video
+            </a>
+            <a href="/history" class="link">
+                <i>📈</i> History
+            </a>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="status-indicator">
+                <span class="dot"></span>
+                <span id="conn-status">Online</span>
+            </div>
+            <div class="version">v2.1.4</div>
+        </div>
+    </aside>
+
+    <!-- ===== OVERLAY FOR MOBILE ===== -->
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <main class="main-content">
+
+        <!-- Top Bar -->
+        <div class="top-bar">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <button class="hamburger" id="hamburgerBtn" aria-label="Toggle sidebar">
+                    ☰
+                </button>
+                <div class="page-title">
+                    <h1>Live Video</h1>
+                    <p>Real-time camera feed</p>
+                </div>
+            </div>
+            <div class="live-chip">
+                <span class="pulse-dot"></span>
+                Live
+            </div>
+        </div>
+
+        <!-- ===== MAIN CONTENT ===== -->
+        <div class="main-grid">
+
+            <!-- Video Panel -->
+            <section class="video-panel">
+                <div class="video-container">
+                    <!-- REC badge -->
+                    <div class="rec-chip" id="recChip" style="display:none;">
+                        <span class="rec-dot"></span>
+                        REC
+                    </div>
+
+                    <!-- Video feed -->
+                    <img src="/video_feed" alt="Live Cradle Stream" id="videoFeed" style="display:none;">
+
+                    <!-- Placeholder -->
+                    <div class="video-placeholder" id="videoPlaceholder">
+                        <div class="spinner"></div>
+                        <div class="big">📷</div>
+                        <span>Waiting for camera feed...</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Info Panel -->
+            <aside class="info-panel">
+
+                <!-- Temperature -->
+                <div class="info-card">
+                    <div class="info-icon">🌡️</div>
+                    <div class="info-meta">
+                        <div class="info-label">Temperature</div>
+                        <div class="info-value" id="temp">-- °C</div>
+                    </div>
+                    <div id="temp-badge" class="status-badge normal">Loading</div>
+                </div>
+
+                <!-- Humidity -->
+                <div class="info-card">
+                    <div class="info-icon">💧</div>
+                    <div class="info-meta">
+                        <div class="info-label">Humidity</div>
+                        <div class="info-value" id="humidity">-- %</div>
+                    </div>
+                    <div id="hum-badge" class="status-badge normal">Loading</div>
+                </div>
+
+                <!-- Motion -->
+                <div class="info-card">
+                    <div class="info-icon">🏃</div>
+                    <div class="info-meta">
+                        <div class="info-label">Motion</div>
+                        <div class="info-value" id="motion">--</div>
+                    </div>
+                </div>
+
+                <!-- Sound -->
+                <div class="info-card">
+                    <div class="info-icon">🔊</div>
+                    <div class="info-meta">
+                        <div class="info-label">Sound</div>
+                        <div class="info-value" id="sound">--</div>
+                    </div>
+                </div>
+
+                <!-- Diaper -->
+                <div class="info-card">
+                    <div class="info-icon">🚼</div>
+                    <div class="info-meta">
+                        <div class="info-label">Diaper</div>
+                        <div class="info-value" id="wetness">--</div>
+                    </div>
+                </div>
+
+            </aside>
+        </div>
+
+        <!-- ===== FOOTER ===== -->
+        <div class="footer">
+            <span>Baby Cradle Monitoring System</span> &middot; v2.1.4
+        </div>
+
+    </main>
+
+    <!-- ===== SCRIPT ===== -->
+    <script>
+        const socket = io();
+
+        // ===== SIDEBAR TOGGLE =====
+        const hamburger = document.getElementById('hamburgerBtn');
+        const sidebar = document.getElementById('sidebar');
+        const overlay = document.getElementById('sidebarOverlay');
+
+        function toggleSidebar() {
+            sidebar.classList.toggle('open');
+            overlay.classList.toggle('active');
+            document.body.style.overflow = sidebar.classList.contains('open') ? 'hidden' : '';
+        }
+
+        hamburger.addEventListener('click', toggleSidebar);
+        overlay.addEventListener('click', toggleSidebar);
+
+        document.querySelectorAll('.sidebar-nav a').forEach(link => {
+            link.addEventListener('click', () => {
+                if (window.innerWidth <= 992) {
+                    sidebar.classList.remove('open');
+                    overlay.classList.remove('active');
+                    document.body.style.overflow = '';
+                }
+            });
+        });
+
+        function getStatus(value, min, max) {
+            if (value == null) return 'normal';
+            if (value < min || value > max) return 'critical';
+            if (value < min + 2 || value > max - 2) return 'warning';
+            return 'normal';
+        }
+
+        socket.on('sensor_update', (data) => {
+            // Update values
+            document.getElementById('temp').textContent = (data.temperature || '--') + ' °C';
+            document.getElementById('humidity').textContent = (data.humidity || '--') + ' %';
+            document.getElementById('motion').textContent = data.motion ? 'Moving' : 'Quiet';
+            document.getElementById('sound').textContent = data.sound ? 'Loud' : 'Quiet';
+            document.getElementById('wetness').textContent = data.wetness ? 'Wet' : 'Dry';
+
+            // Temperature badge
+            const t = getStatus(data.temperature, 20, 25);
+            const tb = document.getElementById('temp-badge');
+            tb.className = 'status-badge ' + t;
+            tb.textContent = t === 'normal' ? 'Normal' : t === 'warning' ? 'Warning' : 'Critical';
+
+            // Humidity badge
+            const h = getStatus(data.humidity, 40, 60);
+            const hb = document.getElementById('hum-badge');
+            hb.className = 'status-badge ' + h;
+            hb.textContent = h === 'normal' ? 'Normal' : h === 'warning' ? 'Warning' : 'Critical';
+        });
+
+        socket.on('disconnect', () => {
+            document.getElementById('conn-status').textContent = 'Offline';
+        });
+        socket.on('connect', () => {
+            document.getElementById('conn-status').textContent = 'Online';
+        });
+
+        // ===== Video feed handling =====
+        const videoImg = document.getElementById('videoFeed');
+        const placeholder = document.getElementById('videoPlaceholder');
+        const recChip = document.getElementById('recChip');
+
+        videoImg.onload = () => {
+            videoImg.style.display = 'block';
+            placeholder.style.display = 'none';
+            recChip.style.display = 'flex';
+        };
+
+        videoImg.onerror = () => {
+            videoImg.style.display = 'none';
+            placeholder.style.display = 'flex';
+            recChip.style.display = 'none';
+        };
+
+        // Refresh video every 5 seconds (cache-busting)
+        setInterval(() => {
+            videoImg.src = '/video_feed?' + Date.now();
+        }, 5000);
+    </script>
+</body>
 </html>
-"""
-
-text_body = (
-    "Baby Cradle Monitoring Alert\n\n"
-    f"Time: {timestamp}\n\n"
-    + "\n".join(
-        f"- {a.get('message', '')}"
-        for a in alerts
-    )
-    + "\n\nOpen the dashboard: "
-    "https://baby-monitoring-system.onrender.com"
-)
-
-payload = {
-    "from": BIRD_SENDER,
-    "to": [to_email],
-    "subject": subject,
-    "html": html,
-    "text": text_body,
-    # Alerts are operational/transactional messages.
-    "category": "transactional",
-}
-
-url = f"{bird_host()}/v1/email/messages"
-
-log.warning(
-    "BIRD EMAIL ATTEMPT: host=%s sender=%s recipient=%s",
-    bird_host(),
-    BIRD_SENDER,
-    to_email
-)
-
-try:
-
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {BIRD_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=20,
-    )
-
-    log.warning(
-        "BIRD RESPONSE: status=%s body=%s",
-        response.status_code,
-        response.text[:1000]
-    )
-
-    if response.status_code in (200, 202):
-
-        try:
-            body = response.json()
-            message_id = body.get("id")
-            status = body.get("status")
-        except Exception:
-            message_id = None
-            status = None
-
-        log.warning(
-            "BIRD EMAIL ACCEPTED: message_id=%s status=%s",
-            message_id,
-            status
-        )
-
-        return True
-
-    log.error(
-        "BIRD EMAIL REJECTED: HTTP %s",
-        response.status_code
-    )
-
-    return False
-
-except requests.RequestException as e:
-
-    log.exception(
-        "BIRD EMAIL NETWORK ERROR: %s",
-        e
-    )
-
-    return False
-
-except Exception as e:
-
-    log.exception(
-        "BIRD EMAIL UNEXPECTED ERROR: %s",
-        e
-    )
-
-    return False
-
-def _send_email_background(alerts, alert_types=None):
-"""
-Send the email outside the sensor worker.
-
-The last-email timestamp is updated ONLY when Bird accepts the
-request. This means a failed send does not consume the cooldown.
-"""
-
-log.warning(
-    "EMAIL WORKER STARTED: %s",
-    [a.get("alert_type") for a in alerts]
-)
-
-success = send_alert_email(alerts)
-
-if success:
-
-    now = time.time()
-
-    with alert_state_lock:
-
-        for alert in alerts:
-
-            alert_type = alert.get("alert_type")
-
-            if alert_type:
-                _last_email_sent[alert_type] = now
-
-    log.warning(
-        "EMAIL DELIVERY HANDOFF SUCCESSFUL"
-    )
-
-else:
-
-    log.error(
-        "EMAIL DELIVERY HANDOFF FAILED — cooldown was NOT consumed"
-    )
-
-_validate_email_config()
-
-============================================================
-
-THRESHOLD / ALERT LOGIC
-
-============================================================
-
-def check_abnormal(temp, hum):
-if temp is not None and (temp < TEMP_MIN or temp > TEMP_MAX):
-return True
-if hum is not None and (hum < HUMIDITY_MIN or hum > HUMIDITY_MAX):
-return True
-return False
-
-def check_alerts(temp, hum, wetness, sound):
-"""
-Alert logic:
-
-  - A state transition must be confirmed by two consecutive readings.
-  - One email is generated when a NEW abnormal event starts.
-  - No repeated email while the event remains active.
-  - Recovery resets the event.
-  - A later event can generate a new email.
-  - A 10-minute safety cooldown protects against rapid oscillation.
-"""
-
-global previous_wetness, previous_temperature_abnormal
-global _wetness_streak, _temp_streak
-
-raw_temperature_abnormal = (
-    temp is not None
-    and (temp < TEMP_MIN or temp > TEMP_MAX)
-)
-
-raw_wetness = bool(wetness)
-
-alerts = []
-now = time.time()
-
-with alert_state_lock:
-
-    # --------------------------------------------------------
-    # TEMPERATURE
-    # --------------------------------------------------------
-
-    old_temperature_state = previous_temperature_abnormal
-
-    if raw_temperature_abnormal != old_temperature_state:
-        _temp_streak += 1
-    else:
-        _temp_streak = 0
-
-    if _temp_streak >= ALERT_DEBOUNCE_READINGS:
-
-        previous_temperature_abnormal = raw_temperature_abnormal
-        _temp_streak = 0
-
-        # NEW abnormal event only.
-        if (
-            not old_temperature_state
-            and raw_temperature_abnormal
-        ):
-
-            last_sent = _last_email_sent.get(
-                "temperature",
-                0
-            )
-
-            if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
-
-                if temp > TEMP_MAX:
-                    message = (
-                        f"Temperature is too high: {temp}°C. "
-                        f"Configured maximum is {TEMP_MAX}°C."
-                    )
-
-                else:
-                    message = (
-                        f"Temperature is too low: {temp}°C. "
-                        f"Configured minimum is {TEMP_MIN}°C."
-                    )
-
-                alerts.append({
-                    "alert_type": "temperature",
-                    "severity": "critical",
-                    "message": message,
-                })
-
-                log.warning(
-                    "NEW TEMPERATURE EVENT CONFIRMED: %s",
-                    message
-                )
-
-            else:
-
-                log.warning(
-                    "Temperature event confirmed but safety "
-                    "cooldown is active."
-                )
-
-        elif (
-            old_temperature_state
-            and not raw_temperature_abnormal
-        ):
-
-            log.info(
-                "Temperature recovered."
-            )
-
-    # --------------------------------------------------------
-    # WETNESS
-    # --------------------------------------------------------
-
-    old_wetness_state = previous_wetness
-
-    if raw_wetness != old_wetness_state:
-        _wetness_streak += 1
-    else:
-        _wetness_streak = 0
-
-    if _wetness_streak >= ALERT_DEBOUNCE_READINGS:
-
-        previous_wetness = raw_wetness
-        _wetness_streak = 0
-
-        # NEW wetness event only.
-        if not old_wetness_state and raw_wetness:
-
-            last_sent = _last_email_sent.get(
-                "wetness",
-                0
-            )
-
-            if now - last_sent >= ALERT_EMAIL_COOLDOWN_SECONDS:
-
-                alerts.append({
-                    "alert_type": "wetness",
-                    "severity": "critical",
-                    "message": (
-                        "Diaper is wet! "
-                        "Please change the diaper."
-                    ),
-                })
-
-                log.warning(
-                    "NEW WETNESS EVENT CONFIRMED"
-                )
-
-            else:
-
-                log.warning(
-                    "Wetness event confirmed but safety "
-                    "cooldown is active."
-                )
-
-        elif old_wetness_state and not raw_wetness:
-
-            log.info(
-                "Wetness recovered."
-            )
-
-if not alerts:
-    return
-
-# Dashboard + Supabase alert record.
-for alert in alerts:
-
-    log.warning(
-        "NEW ALERT: %s",
-        alert["message"]
-    )
-
-    socketio.emit(
-        "new_alert",
-        alert
-    )
-
-    if supabase is not None:
-
-        try:
-
-            supabase.table(
-                "alerts"
-            ).insert(
-                alert
-            ).execute()
-
-        except Exception as e:
-
-            log.error(
-                "Supabase alert insert error: %s",
-                e
-            )
-
-# Flask-SocketIO/gevent-compatible background task.
-socketio.start_background_task(
-    _send_email_background,
-    alerts
-)
-
-log.warning(
-    "EMAIL QUEUED FOR ALERT EVENT"
-)
-
-============================================================
-
-READING WORKER (single background consumer)
-
-============================================================
-
-def _reading_worker():
-while True:
-temp, hum, motion, sound, wetness = _reading_queue.get()
-try:
-if supabase is not None:
-reading = {
-"temperature": temp, "humidity": hum,
-"motion_detected": motion, "sound_level": sound,
-"wetness_detected": wetness,
-"is_abnormal": check_abnormal(temp, hum),
-}
-try:
-supabase.table("sensor_readings").insert(reading).execute()
-except Exception as e:
-log.error("DB insert error: %s", e)
-
-        check_alerts(temp, hum, wetness, sound)
-    finally:
-        _reading_queue.task_done()
-
-threading.Thread(target=_reading_worker, daemon=True).start()
-
-============================================================
-
-DASHBOARD BROADCASTER — pushes sensor_update at most every
-
-DASHBOARD_PUSH_INTERVAL seconds, regardless of ingest rate.
-
-Video is intentionally NOT throttled — it stays event-driven/live.
-
-============================================================
-
-def _dashboard_broadcaster():
-global _last_broadcast_update
-while True:
-socketio.sleep(DASHBOARD_PUSH_INTERVAL)
-with _data_lock:
-if current_data["last_update"] == _last_broadcast_update:
-continue  # no new reading since last push, skip
-snapshot = dict(current_data)
-_last_broadcast_update = current_data["last_update"]
-socketio.emit("sensor_update", snapshot)
-
-============================================================
-
-PAGES
-
-============================================================
-
-@app.route("/")
-def index():
-return render_template("index.html")
-
-@app.route("/live")
-def live():
-return render_template("live.html")
-
-@app.route("/history")
-def history():
-return render_template("history.html")
-
-============================================================
-
-API — CURRENT DATA / HISTORY / ALERTS
-
-============================================================
-
-@app.route("/api/current_data")
-def api_current_data():
-with _data_lock:
-return jsonify(current_data)
-
-@app.route("/api/history")
-def api_history():
-if supabase is None:
-return jsonify([])
-limit = request.args.get("limit", 100, type=int)
-try:
-response = (supabase.table("sensor_readings").select("*")
-.order("created_at", desc=True).limit(limit).execute())
-return jsonify(response.data)
-except Exception as e:
-log.error("History error: %s", e)
-return jsonify({"error": str(e)}), 500
-
-@app.route("/api/alerts")
-def api_alerts():
-if supabase is None:
-return jsonify([])
-limit = request.args.get("limit", 50, type=int)
-try:
-response = (supabase.table("alerts").select("*")
-.order("created_at", desc=True).limit(limit).execute())
-return jsonify(response.data)
-except Exception as e:
-log.error("Alert history error: %s", e)
-return jsonify({"error": str(e)}), 500
-
-@app.route("/api/clear_alerts", methods=["POST"])
-def clear_alerts():
-if supabase is None:
-return jsonify({"success": True})
-try:
-supabase.table("alerts").update({"is_read": True}).neq("is_read", True).execute()
-return jsonify({"success": True})
-except Exception as e:
-return jsonify({"error": str(e)}), 500
-
-============================================================
-
-EMAIL TEST
-
-============================================================
-
-@app.route("/api/test-email", methods=["POST"])
-def api_test_email():
-
-"""
-Test Bird directly from Render.
-
-Render environment variable required:
-    EMAIL_TEST_TOKEN=<your secret>
-
-Header:
-    X-Email-Test-Token: <your secret>
-
-Optional JSON:
-    {"recipient": "delivered@messagebird.dev"}
-
-The Bird sandbox recipient delivered@messagebird.dev is useful
-for proving that the API pipeline works without depending on
-the user's mailbox.
-"""
-
-if not EMAIL_TEST_TOKEN:
-
-    log.error(
-        "TEST EMAIL DISABLED: EMAIL_TEST_TOKEN is not configured"
-    )
-
-    return jsonify({
-        "ok": False,
-        "error": "EMAIL_TEST_TOKEN is not configured on Render."
-    }), 503
-
-supplied_token = request.headers.get(
-    "X-Email-Test-Token",
-    ""
-)
-
-if not hmac.compare_digest(
-    supplied_token,
-    EMAIL_TEST_TOKEN
-):
-
-    return jsonify({
-        "ok": False,
-        "error": "Unauthorized."
-    }), 401
-
-data = request.get_json(
-    silent=True
-) or {}
-
-recipient = (
-    data.get("recipient")
-    or ALERT_EMAIL
-).strip()
-
-if not recipient:
-
-    return jsonify({
-        "ok": False,
-        "error": "No recipient configured."
-    }), 400
-
-test_alert = [{
-    "alert_type": "test",
-    "severity": "info",
-    "message": "Baby Monitor email test from Render."
-}]
-
-socketio.start_background_task(
-    _test_email_background,
-    test_alert,
-    recipient
-)
-
-log.warning(
-    "TEST EMAIL QUEUED: recipient=%s",
-    recipient
-)
-
-return jsonify({
-    "ok": True,
-    "message": "Test email queued. Check Render logs."
-}), 202
-
-def _test_email_background(alerts, recipient):
-
-log.warning(
-    "TEST EMAIL WORKER STARTED: recipient=%s",
-    recipient
-)
-
-success = send_alert_email(
-    alerts,
-    recipient=recipient
-)
-
-if success:
-
-    log.warning(
-        "TEST EMAIL ACCEPTED BY BIRD"
-    )
-
-else:
-
-    log.error(
-        "TEST EMAIL FAILED"
-    )
-
-============================================================
-
-RASPBERRY PI INGEST
-
-current_data is updated immediately (so /api/current_data is
-
-always fresh), DB write + alert checks happen on the worker
-
-thread immediately, but the dashboard socket push is
-
-throttled to once every DASHBOARD_PUSH_INTERVAL seconds by
-
-_dashboard_broadcaster above.
-
-============================================================
-
-@app.route("/api/ingest", methods=["POST"])
-def api_ingest():
-data = request.get_json(silent=True) or {}
-
-if "temperature" not in data or "humidity" not in data:
-    return jsonify({"error": "Missing required fields: temperature, humidity"}), 400
-
-temp = data.get("temperature")
-hum = data.get("humidity")
-motion = data.get("motion_detected", False)
-sound = data.get("sound_level", 0)
-wetness = data.get("wetness_detected", False)
-
-with _data_lock:
-    current_data.update({
-        "temperature": temp, "humidity": hum, "motion": motion,
-        "sound": sound, "wetness": wetness,
-        "last_update": datetime.now().isoformat(),
-    })
-
-_reading_queue.put((temp, hum, motion, sound, wetness))
-
-return jsonify({"status": "ok", "abnormal": check_abnormal(temp, hum)})
-
-============================================================
-
-VIDEO — FRAME UPLOAD (unthrottled, immediate broadcast)
-
-============================================================
-
-@app.route("/api/upload_frame", methods=["POST"])
-def api_upload_frame():
-global latest_frame
-
-data = request.get_data()
-if not data or len(data) < 100:
-    return jsonify({"error": "Empty or invalid frame"}), 400
-
-with _frame_lock:
-    latest_frame = data
-
-_broadcast_frame(data)
-return jsonify({"status": "ok"})
-
-============================================================
-
-VIDEO — LIVE MJPEG STREAM (event-driven, stays real-time)
-
-============================================================
-
-@app.route("/video_feed")
-def video_feed():
-def generate():
-q = queue.Queue(maxsize=1)
-with _subscribers_lock:
-_frame_subscribers.append(q)
-try:
-with _frame_lock:
-if latest_frame is not None:
-yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + latest_frame + b"\r\n")
-while True:
-frame = q.get()
-yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-finally:
-with _subscribers_lock:
-if q in _frame_subscribers:
-_frame_subscribers.remove(q)
-
-return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
-
-============================================================
-
-CHATBOT
-
-============================================================
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-data = request.get_json(silent=True) or {}
-msg = (data.get("message") or "").lower().strip()
-
-with _data_lock:
-    d = dict(current_data)
-
-temp = d.get("temperature") if d.get("temperature") is not None else "--"
-hum = d.get("humidity") if d.get("humidity") is not None else "--"
-motion_str = "moving" if d.get("motion") else "quiet/sleeping"
-diaper_str = "wet — needs changing" if d.get("wetness") else "dry"
-
-if any(w in msg for w in ["temp", "hot", "cold", "warm"]):
-    reply = f"The current temperature is {temp}°C. Safe range is {TEMP_MIN}–{TEMP_MAX}°C."
-    if temp != "--":
-        if temp < TEMP_MIN:
-            reply += " It's **below** the minimum."
-        elif temp > TEMP_MAX:
-            reply += " It's **above** the maximum."
-        else:
-            reply += " This is within the normal range."
-
-elif any(w in msg for w in ["humid", "moist"]):
-    reply = f"The current humidity is {hum}%. Safe range is {HUMIDITY_MIN}–{HUMIDITY_MAX}%."
-    if hum != "--":
-        if hum < HUMIDITY_MIN:
-            reply += " It's **below** the minimum."
-        elif hum > HUMIDITY_MAX:
-            reply += " It's **above** the maximum."
-        else:
-            reply += " This is within the normal range."
-
-elif any(w in msg for w in ["motion", "move", "moving", "activity", "active"]):
-    reply = f"Baby is currently **{motion_str}**."
-    reply += " Recent motion was detected." if d.get("motion") else " No recent motion was detected."
-
-elif any(w in msg for w in ["sound", "noise", "loud", "cry", "crying"]):
-    if d.get("sound"):
-        reply = "Sound level is currently **loud/noisy**. This may indicate crying or a loud environment."
-    else:
-        reply = "Sound level is currently **quiet**. No loud sounds detected."
-
-elif any(w in msg for w in ["diaper", "wet", "wee", "nappy", "change"]):
-    reply = f"Diaper is **{diaper_str}**."
-    reply += " It's time for a change!" if d.get("wetness") else " All good, no change needed."
-
-elif any(w in msg for w in ["hi", "hello", "hey", "help"]):
-    reply = ("Hello! I'm your Baby Cradle Monitoring assistant. Ask about "
-             "**temperature**, **humidity**, **motion**, **sound**, or **diaper**.")
-
-elif any(w in msg for w in ["status", "summary", "all", "overview"]):
-    flags = []
-    if d.get("motion"):
-        flags.append("motion detected")
-    if d.get("wetness"):
-        flags.append("wet diaper")
-    if check_abnormal(temp if temp != "--" else None, hum if hum != "--" else None):
-        flags.append("⚠️ abnormal readings")
-
-    reply = (f"**Temperature:** {temp}°C  |  **Humidity:** {hum}%  |  "
-             f"**Motion:** {motion_str}  |  "
-             f"**Sound:** {'loud' if d.get('sound') else 'quiet'}  |  "
-             f"**Diaper:** {diaper_str}")
-    if flags:
-        reply += f"\n\nNotable: {' · '.join(flags)}"
-
-else:
-    reply = ("I can answer about: **temperature**, **humidity**, **motion**, "
-             "**sound**, **diaper**, or say **status** for a full summary.")
-
-return jsonify({"reply": reply})
-
-============================================================
-
-START SERVER
-
-============================================================
-
-socketio.start_background_task(_dashboard_broadcaster)
-
-if name == "main":
-port = int(os.getenv("PORT", 5000))
-debug = os.getenv("RENDER") is None
-log.info(
-"Baby Cradle Monitoring Server starting on port %s...",
-port
-)
-_validate_email_config()
-socketio.run(app, host="0.0.0.0", port=port, debug=debug, allow_unsafe_werkzeug=True)
