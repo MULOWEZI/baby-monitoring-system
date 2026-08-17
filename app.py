@@ -1013,6 +1013,38 @@ HUM_MIN = float(os.getenv("HUM_MIN", "40"))
 HUM_MAX = float(os.getenv("HUM_MAX", "60"))
 
 
+# ============================================================
+# TEMPERATURE / HUMIDITY ABNORMALITY CHECK
+# ============================================================
+
+def check_abnormal(temp, hum):
+    """
+    Return True when temperature or humidity is outside the
+    configured safe operating range.
+
+    Uses the same thresholds as the alert and forecasting systems.
+    None values are ignored so status/forecast calls do not crash.
+    """
+
+    if temp is not None:
+        try:
+            temp_value = float(temp)
+            if temp_value < TEMP_MIN or temp_value > TEMP_MAX:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    if hum is not None:
+        try:
+            hum_value = float(hum)
+            if hum_value < HUM_MIN or hum_value > HUM_MAX:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    return False
+
+
 def linear_forecast(points, horizon_seconds):
     """
     Simple least-squares linear trend forecast.
