@@ -165,6 +165,88 @@ def should_commit_sensor_reading():
         return False
 
 
+
+# ============================================================
+# SUPABASE SENSOR STORAGE
+# ============================================================
+
+def save_sensor_reading_to_supabase(
+    temp,
+    hum,
+    motion,
+    sound,
+    wetness
+):
+    """
+    Save one accepted 5-second sensor sample to Supabase.
+
+    Database columns:
+      temperature       DOUBLE PRECISION
+      humidity          DOUBLE PRECISION
+      motion_detected   BOOLEAN
+      sound_level       INTEGER
+      wetness_detected  BOOLEAN
+      is_abnormal       BOOLEAN
+      created_at        TIMESTAMPTZ (database default)
+
+    sound is explicitly converted to int because the database column
+    is INTEGER and sensor values can arrive as 0.0 / 1.0.
+    """
+
+    if supabase is None:
+        raise RuntimeError("Supabase client is not configured.")
+
+    temperature = float(temp)
+    humidity = float(hum)
+    motion_detected = bool(motion)
+    sound_level = int(float(sound))
+    wetness_detected = bool(wetness)
+
+    # Use the same temperature/humidity limits used by the alert logic.
+    is_abnormal = (
+        temperature < TEMP_MIN
+        or temperature > TEMP_MAX
+        or humidity < HUM_MIN
+        or humidity > HUM_MAX
+    )
+
+    payload = {
+        "temperature": temperature,
+        "humidity": humidity,
+        "motion_detected": motion_detected,
+        "sound_level": sound_level,
+        "wetness_detected": wetness_detected,
+        "is_abnormal": is_abnormal,
+    }
+
+    log.info(
+        "Supabase sensor payload: %s",
+        payload
+    )
+
+    response = (
+        supabase
+        .table("sensor_readings")
+        .insert(payload)
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            "Supabase insert returned no sensor reading."
+        )
+
+    saved = response.data[0]
+
+    log.info(
+        "Sensor reading saved to Supabase: id=%s",
+        saved.get("id")
+    )
+
+    return saved
+
+
+# ============================================================
 # ============================================================
 # VIDEO STREAMING
 # ============================================================
