@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Baby Cradle Monitoring System - Login</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f0f6ff;--surface:#fff;--primary:#2563eb;--primary-dark:#1d4ed8;--text:#0a1a3a;--muted:#5a7a9a;--border:#dbe7f5;--danger:#dc2626;--success:#16a34a;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;font-family:Inter,Arial,sans-serif;background:linear-gradient(135deg,#f0f6ff,#fff);display:flex;align-items:center;justify-content:center;color:var(--text);padding:20px;}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at 15% 20%,rgba(37,99,235,.08),transparent 35%),radial-gradient(circle at 85% 80%,rgba(96,165,250,.08),transparent 35%);}
+.login-shell{width:min(430px,100%);position:relative;z-index:1;}
+.brand{text-align:center;margin-bottom:24px}.logo{width:64px;height:64px;border-radius:18px;background:linear-gradient(135deg,#2563eb,#60a5fa);display:grid;place-items:center;font-size:2rem;margin:0 auto 14px;box-shadow:0 12px 30px rgba(37,99,235,.25)}
+.brand h1{font-size:1.55rem;font-weight:800;letter-spacing:-.03em}.brand p{margin-top:6px;color:var(--muted);font-size:.82rem}
+.card{background:rgba(255,255,255,.94);border:1px solid var(--border);border-radius:22px;padding:28px;box-shadow:0 18px 50px rgba(37,99,235,.10);backdrop-filter:blur(10px)}
+.card h2{font-size:1.1rem;margin-bottom:5px}.subtitle{font-size:.76rem;color:var(--muted);margin-bottom:22px}
+.field{margin-bottom:16px}.field label{display:block;font-size:.75rem;font-weight:700;margin-bottom:7px}.field input{width:100%;padding:12px 14px;border:1px solid var(--border);border-radius:12px;outline:none;font:inherit;font-size:.85rem;color:var(--text);background:#f8fbff;transition:.2s}.field input:focus{border-color:var(--primary);box-shadow:0 0 0 4px rgba(37,99,235,.09);background:#fff}
+.password-wrap{position:relative}.password-wrap input{padding-right:70px}.toggle-password{position:absolute;right:9px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:var(--muted);font-size:.7rem;font-weight:700;cursor:pointer;padding:6px}
+button.login-btn{width:100%;border:0;border-radius:12px;padding:13px;background:linear-gradient(135deg,#2563eb,#3b82f6);color:#fff;font:700 .84rem Inter;cursor:pointer;box-shadow:0 8px 20px rgba(37,99,235,.22);transition:.2s}.login-btn:hover{transform:translateY(-1px);background:linear-gradient(135deg,#1d4ed8,#2563eb)}.login-btn:disabled{opacity:.6;cursor:not-allowed;transform:none}
+.message{display:none;border-radius:10px;padding:10px 12px;font-size:.74rem;margin-bottom:15px}.message.error{display:block;background:#fef2f2;color:var(--danger);border:1px solid #fecaca}.message.success{display:block;background:#f0fdf4;color:var(--success);border:1px solid #bbf7d0}
+.footer{text-align:center;color:var(--muted);font-size:.65rem;margin-top:18px}.security{margin-top:14px;text-align:center;color:var(--muted);font-size:.63rem}
+</style>
+</head>
+<body>
+<div class="login-shell">
+  <div class="brand"><div class="logo">🚼</div><h1>Baby Cradle</h1><p>Smart Monitoring System</p></div>
+  <div class="card">
+    <h2>Welcome back</h2><p class="subtitle">Sign in to access the monitoring dashboard.</p>
+    <div id="message" class="message"></div>
+    <form id="loginForm" autocomplete="on">
+      <div class="field"><label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="username" placeholder="Enter your email" required></div>
+      <div class="field"><label for="password">Password</label><div class="password-wrap"><input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required><button type="button" class="toggle-password" id="togglePassword">Show</button></div></div>
+      <button type="submit" class="login-btn" id="loginBtn">Sign In</button>
+    </form>
+    <div class="security">🔒 Your account is protected by Supabase Authentication.</div>
+  </div>
+  <div class="footer">Baby Cradle Monitoring System</div>
+</div>
+<script>
+const form=document.getElementById('loginForm');
+const btn=document.getElementById('loginBtn');
+const message=document.getElementById('message');
+const password=document.getElementById('password');
+const toggle=document.getElementById('togglePassword');
+function showMessage(text,type='error'){message.textContent=text;message.className='message '+type;}
+toggle.addEventListener('click',()=>{const hidden=password.type==='password';password.type=hidden?'text':'password';toggle.textContent=hidden?'Hide':'Show';});
+form.addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  message.className='message';message.textContent='';btn.disabled=true;btn.textContent='Signing in…';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('email').value.trim(),password:password.value})});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok){showMessage(data.message||'Login failed. Please check your credentials.');return;}
+    showMessage('Login successful. Opening dashboard…','success');
+    window.location.replace('/');
+  }catch(err){console.error(err);showMessage('Unable to connect to the server. Please try again.');}
+  finally{btn.disabled=false;btn.textContent='Sign In';}
+});
+</script>
+</body>
+</html>
