@@ -7,7 +7,6 @@ import queue
 import threading
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 # IMPORTANT:
 # This application runs under Gunicorn's geventwebsocket worker.
@@ -351,6 +350,8 @@ def send_alert_email(alerts):
         )
 
     # Use Lusaka time for the email timestamp.
+    from zoneinfo import ZoneInfo
+
     timestamp = datetime.now(
         ZoneInfo("Africa/Lusaka")
     ).strftime(
@@ -551,230 +552,530 @@ def send_alert_email_async(alerts):
 # ALERT STATE
 # ============================================================
 
-# Email behavior:
-# - Temperature email is sent immediately when temperature goes
-#   outside TEMP_MIN / TEMP_MAX.
-# - Wet-diaper email is sent immediately when wetness is detected.
-# - No consecutive-reading requirement.
-# - No humidity emails.
-# - No motion emails.
-# - No sound emails.
-# - The same active condition is latched so it does not generate
-#   a new email every 5 seconds.
-# - The condition resets when temperature returns to range or
-#   the diaper becomes dry.
+#
+# These variables prevent repeated alerts while the SAME
+# condition remains active.
+#
+# Example:
+#
+# dry -> wet       = alert
+# wet -> wet       = nothing
+# wet -> dry       = reset
+# dry -> wet       = alert again
+#
+# Same principle for temperature.
+# ============================================================
 
-_alert_lock = threading.Lock()
+alert_state_lock = threading.Lock()
 
-_condition_latched = {
-    "temperature": False,
-    "wetness": False,
-}
+previous_wetness = False
+
+previous_temperature_abnormal = False
 
 
-def reset_condition(condition):
-    """Reset one alert condition so a future occurrence can email again."""
-    with _alert_lock:
-        _condition_latched[condition] = False
+# ============================================================
+# BIRD HOST
+# ============================================================
+
+def bird_host():
+
+    """
+    Derive Bird platform host from the API key region.
+
+    Example:
+        bk_us1_xxxxx
+        -> https://us1.platform.bird.com
+    """
+
+    parts = BIRD_API_KEY.split("_")
+
+    region = (
+        parts[1]
+        if len(parts) > 1 and parts[1]
+        else "us1"
+    )
+
+    return f"https://{region}.platform.bird.com"
+
+
+# ============================================================
+# SEND EMAIL
+# ============================================================
+
+def send_alert_email(alerts):
+
+    """
+    Sends one email containing the supplied alerts.
+
+    This function is only called when a NEW alert event
+    occurs.
+    """
+
+    if not alerts:
+
+        return False
+
+
+    if not BIRD_API_KEY:
+
+        log.warning(
+            "BIRD_API_KEY not set — skipping email notification"
+        )
+
+        return False
+
+
+    if not ALERT_EMAIL:
+
+        log.warning(
+            "ALERT_EMAIL not set — skipping email notification"
+        )
+
+        return False
+
+
+    # --------------------------------------------------------
+    # Determine email subject
+    # --------------------------------------------------------
+
+    alert_types = {
+        alert.get("alert_type")
+        for alert in alerts
+    }
+
+
+    if "wetness" in alert_types:
+
+        subject = "💧 Wet Diaper Detected"
+
+    elif "temperature" in alert_types:
+
+        subject = "🌡️ Temperature Alert"
+
+    else:
+
+        subject = "🚼 Baby Monitoring Alert"
+
+
+    # --------------------------------------------------------
+    # Create HTML alert list
+    # --------------------------------------------------------
+
+    items = ""
+
+    for alert in alerts:
+
+        items += (
+            "<li>"
+            f"<strong>{alert.get('severity', 'warning').upper()}</strong>"
+            " — "
+            f"{alert.get('message', '')}"
+            "</li>"
+        )
+
+
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+    html = f"""
+    <html>
+
+    <body>
+
+        <h2>🚼 Baby Cradle Monitoring Alert</h2>
+
+        <p>
+            A new condition requiring attention
+            was detected.
+        </p>
+
+        <p>
+            <strong>Time:</strong> {timestamp}
+        </p>
+
+        <ul>
+            {items}
+        </ul>
+
+        <p>
+            Please check the baby monitoring dashboard.
+        </p>
+
+        <p>
+            <a href="https://baby-monitoring-system.onrender.com">
+                Open Baby Monitoring Dashboard
+            </a>
+        </p>
+
+    </body>
+
+    </html>
+    """
+
+
+    payload = {
+
+        "from": BIRD_SENDER,
+
+        "to": [
+            ALERT_EMAIL
+        ],
+
+        "subject": subject,
+
+        "html": html
+    }
+
+
+    try:
+
+        response = requests.post(
+
+            f"{bird_host()}/v1/email/messages",
+
+            headers={
+
+                "Authorization":
+                    f"Bearer {BIRD_API_KEY}",
+
+                "Content-Type":
+                    "application/json"
+            },
+
+            json=payload,
+
+            timeout=15
+        )
+
+
+        if response.status_code in (200, 202):
+
+            log.info(
+                "Alert email sent to %s (%s)",
+                ALERT_EMAIL,
+                response.status_code
+            )
+
+            return True
+
+
+        log.error(
+            "Bird email failed %s: %s",
+            response.status_code,
+            response.text[:300]
+        )
+
+
+    except Exception as e:
+
+        log.error(
+            "Bird email exception: %s",
+            e
+        )
+
+
+    return False
+
+
+# ============================================================
+# TEMPERATURE / HUMIDITY CHECK
+# ============================================================
+
+def check_abnormal(temp, hum):
+
+    temp_min = float(
+        os.getenv("TEMP_MIN", 20)
+    )
+
+    temp_max = float(
+        os.getenv("TEMP_MAX", 25)
+    )
+
+    hum_min = float(
+        os.getenv("HUMIDITY_MIN", 40)
+    )
+
+    hum_max = float(
+        os.getenv("HUMIDITY_MAX", 60)
+    )
+
+
+    if temp is not None:
+
+        if (
+            temp < temp_min
+            or
+            temp > temp_max
+        ):
+
+            return True
+
+
+    if hum is not None:
+
+        if (
+            hum < hum_min
+            or
+            hum > hum_max
+        ):
+
+            return True
+
+
+    return False
 
 
 # ============================================================
 # EVENT-BASED ALERT LOGIC
 # ============================================================
 
-def check_alerts(temp, hum, wetness, sound):
+def check_alerts(
+    temp,
+    hum,
+    wetness,
+    sound
+):
+
     """
-    Generate alerts only for the two conditions requested:
+    Detect NEW alert events.
 
-    1. Temperature is outside TEMP_MIN <= temperature <= TEMP_MAX.
-    2. Diaper is wet.
+    WETNESS:
 
-    There is NO consecutive-reading requirement.
+        False -> True
+        = NEW EVENT
 
-    A condition sends one email when it first becomes active.
-    While that condition remains active, additional 5-second
-    readings do not send duplicate emails.
+        True -> True
+        = NO NEW EVENT
 
-    Once the condition returns to normal, its latch is reset.
-    A later occurrence can then send another email.
+        True -> False
+        = RESET
+
+    TEMPERATURE:
+
+        Normal -> Abnormal
+        = NEW EVENT
+
+        Abnormal -> Abnormal
+        = NO NEW EVENT
+
+        Abnormal -> Normal
+        = RESET
     """
 
-    confirmed = []
+    global previous_wetness
+    global previous_temperature_abnormal
+
 
     # ========================================================
-    # TEMPERATURE
+    # THRESHOLDS
     # ========================================================
 
-    temperature_abnormal = (
-        temp < TEMP_MIN or
-        temp > TEMP_MAX
+    temp_min = float(
+        os.getenv("TEMP_MIN", 20)
     )
 
-    if temperature_abnormal:
+    temp_max = float(
+        os.getenv("TEMP_MAX", 25)
+    )
 
-        with _alert_lock:
 
-            if not _condition_latched["temperature"]:
+    alerts = []
 
-                _condition_latched["temperature"] = True
 
-                if temp > TEMP_MAX:
+    # ========================================================
+    # CURRENT TEMPERATURE STATE
+    # ========================================================
 
-                    confirmed.append({
-                        "alert_type": "temperature",
-                        "severity": "critical",
-                        "message": (
-                            f"Temperature is too high: {temp:.1f}°C. "
-                            f"Configured maximum is {TEMP_MAX:.1f}°C."
-                        )
-                    })
+    temperature_abnormal = False
 
-                elif temp < TEMP_MIN:
 
-                    confirmed.append({
-                        "alert_type": "temperature",
-                        "severity": "critical",
-                        "message": (
-                            f"Temperature is too low: {temp:.1f}°C. "
-                            f"Configured minimum is {TEMP_MIN:.1f}°C."
-                        )
-                    )
+    if temp is not None:
 
-                log.warning(
-                    "ALERT DETECTED: temperature outside range: %.1f°C",
-                    temp
+        temperature_abnormal = (
+
+            temp < temp_min
+
+            or
+
+            temp > temp_max
+        )
+
+
+    # ========================================================
+    # WETNESS STATE
+    # ========================================================
+
+    current_wetness = bool(
+        wetness
+    )
+
+
+    # ========================================================
+    # LOCK STATE CHANGES
+    # ========================================================
+
+    with alert_state_lock:
+
+
+        # ----------------------------------------------------
+        # TEMPERATURE
+        # ----------------------------------------------------
+
+        new_temperature_event = (
+
+            temperature_abnormal
+
+            and
+
+            not previous_temperature_abnormal
+        )
+
+
+        if new_temperature_event:
+
+            if temp > temp_max:
+
+                message = (
+                    f"🌡️ Temperature is too high: "
+                    f"{temp}°C. "
+                    f"Configured maximum is "
+                    f"{temp_max}°C."
                 )
 
-    else:
+            elif temp < temp_min:
 
-        if _condition_latched["temperature"]:
-            log.info(
-                "ALERT RESET: temperature returned to normal range: %.1f°C",
-                temp
-            )
-
-        reset_condition("temperature")
-
-
-    # ========================================================
-    # WET DIAPER
-    # ========================================================
-
-    if bool(wetness):
-
-        with _alert_lock:
-
-            if not _condition_latched["wetness"]:
-
-                _condition_latched["wetness"] = True
-
-                confirmed.append({
-                    "alert_type": "wetness",
-                    "severity": "critical",
-                    "message": (
-                        "Diaper is wet! Please change the diaper."
-                    )
-                })
-
-                log.warning(
-                    "ALERT DETECTED: wet diaper"
+                message = (
+                    f"🌡️ Temperature is too low: "
+                    f"{temp}°C. "
+                    f"Configured minimum is "
+                    f"{temp_min}°C."
                 )
 
-    else:
+            else:
 
-        if _condition_latched["wetness"]:
-            log.info(
-                "ALERT RESET: diaper is dry"
-            )
+                message = (
+                    f"🌡️ Abnormal temperature detected: "
+                    f"{temp}°C."
+                )
 
-        reset_condition("wetness")
+
+            alerts.append({
+
+                "alert_type": "temperature",
+
+                "severity": "critical",
+
+                "message": message
+            })
+
+
+        # Save current temperature state
+
+        previous_temperature_abnormal = (
+            temperature_abnormal
+        )
+
+
+        # ----------------------------------------------------
+        # WET DIAPER
+        # ----------------------------------------------------
+
+        new_wetness_event = (
+
+            current_wetness
+
+            and
+
+            not previous_wetness
+        )
+
+
+        if new_wetness_event:
+
+            alerts.append({
+
+                "alert_type": "wetness",
+
+                "severity": "critical",
+
+                "message":
+                    "💧 Diaper is wet! "
+                    "Please change the diaper."
+            })
+
+
+        # Save current wetness state
+
+        previous_wetness = (
+            current_wetness
+        )
 
 
     # ========================================================
-    # IMPORTANT:
-    # Humidity, motion and sound intentionally do NOT create
-    # email alerts.
+    # NO NEW EVENTS
     # ========================================================
 
-    if not confirmed:
-        return []
+    if not alerts:
+
+        return
 
 
     # ========================================================
     # SAVE ALERTS TO SUPABASE
     # ========================================================
 
-    saved_alerts = []
+    if supabase is not None:
 
-    if supabase is None:
-
-        log.error(
-            "ALERT: Supabase is not configured; alert cannot be saved."
-        )
-
-    else:
-
-        for alert in confirmed:
+        for alert in alerts:
 
             try:
 
-                response = (
-                    supabase
-                    .table("alerts")
-                    .insert(alert)
-                    .execute()
+                supabase.table(
+                    "alerts"
+                ).insert(
+                    alert
+                ).execute()
+
+
+                # Immediately update dashboard
+
+                socketio.emit(
+                    "new_alert",
+                    alert
                 )
 
-                saved = (
-                    response.data[0]
-                    if response.data
-                    else alert
-                )
 
-                saved_alerts.append(saved)
-
-                log.warning(
-                    "ALERT SAVED: %s",
+                log.info(
+                    "NEW ALERT: %s",
                     alert["message"]
                 )
+
 
             except Exception as e:
 
                 log.error(
-                    "Failed to save alert: %s",
+                    "Supabase alert insert error: %s",
                     e
                 )
 
-                # Still keep the alert available for email.
-                # This prevents a temporary alerts-table problem
-                # from completely suppressing the email.
-                saved_alerts.append(alert)
-
 
     # ========================================================
-    # SEND EMAIL IMMEDIATELY
+    # SEND ONE EMAIL FOR THE NEW EVENT
     # ========================================================
 
-    if confirmed:
-
-        threading.Thread(
-            target=send_alert_email_async,
-            args=(list(confirmed),),
-            daemon=True
-        ).start()
-
-        log.info(
-            "EMAIL QUEUED: temperature/wetness condition detected"
-        )
-
-
-    return saved_alerts
+    # Do not block sensor processing while Bird is contacted.
+    threading.Thread(
+        target=send_alert_email_async,
+        args=(list(alerts),),
+        daemon=True
+    ).start()
 
 
 # ============================================================
 # PROCESS SENSOR READING
 # ============================================================
-
 
 def save_sensor_reading_to_supabase(
     temp,
@@ -1027,38 +1328,6 @@ HUM_MIN = float(os.getenv("HUM_MIN", "40"))
 HUM_MAX = float(os.getenv("HUM_MAX", "60"))
 
 
-# ============================================================
-# TEMPERATURE / HUMIDITY ABNORMALITY CHECK
-# ============================================================
-
-def check_abnormal(temp, hum):
-    """
-    Return True when temperature or humidity is outside the
-    configured safe operating range.
-
-    Uses the same thresholds as the alert and forecasting systems.
-    None values are ignored so status/forecast calls do not crash.
-    """
-
-    if temp is not None:
-        try:
-            temp_value = float(temp)
-            if temp_value < TEMP_MIN or temp_value > TEMP_MAX:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-    if hum is not None:
-        try:
-            hum_value = float(hum)
-            if hum_value < HUM_MIN or hum_value > HUM_MAX:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-    return False
-
-
 def linear_forecast(points, horizon_seconds):
     """
     Simple least-squares linear trend forecast.
@@ -1252,7 +1521,7 @@ def get_environment_forecast():
             ) / 60,
             2
         ),
-        "generated_at": datetime.now(ZoneInfo("Africa/Lusaka")).isoformat(),
+        "generated_at": datetime.now().isoformat(),
         "current": {
             "temperature": round(
                 latest_temp,
