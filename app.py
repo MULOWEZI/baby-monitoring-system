@@ -1310,6 +1310,258 @@ def api_test_email():
 
 
 # ============================================================
+# BASIC ENVIRONMENTAL FORECASTING
+# ============================================================
+
+# Forecasts use the most recent stored readings. Because the system
+# stores one reading every 5 seconds, 60 samples represent 5 minutes.
+FORECAST_SAMPLE_COUNT = 60
+FORECAST_HORIZONS_MINUTES = (5, 10, 15)
+
+
+def linear_forecast(points, horizon_seconds):
+    """
+    Simple least-squares linear trend forecast.
+
+    points:
+        list of (timestamp_seconds, value)
+
+    Returns the predicted value at the requested future horizon.
+    """
+    if len(points) < 2:
+        return None
+
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+
+    denominator = sum(
+        (x - mean_x) ** 2
+        for x in xs
+    )
+
+    if denominator == 0:
+        return mean_y
+
+    slope = sum(
+        (x - mean_x) * (y - mean_y)
+        for x, y in zip(xs, ys)
+    ) / denominator
+
+    intercept = mean_y - slope * mean_x
+
+    future_x = xs[-1] + float(horizon_seconds)
+
+    return intercept + slope * future_x
+
+
+def get_environment_forecast():
+    """
+    Retrieve recent environmental readings from Supabase and
+    produce basic linear forecasts for temperature and humidity.
+
+    This is intentionally a simple baseline forecast suitable for
+    a project-level 'basic forecasting analytics' requirement.
+    """
+
+    if supabase is None:
+        raise RuntimeError("Supabase is not configured.")
+
+    response = (
+        supabase
+        .table("sensor_readings")
+        .select(
+            "temperature,humidity,created_at"
+        )
+        .order(
+            "created_at",
+            desc=True
+        )
+        .limit(
+            FORECAST_SAMPLE_COUNT
+        )
+        .execute()
+    )
+
+    rows = list(reversed(response.data or []))
+
+    if len(rows) < 2:
+        return {
+            "status": "insufficient_data",
+            "samples": len(rows),
+            "required_samples": 2,
+            "forecast_minutes": list(
+                FORECAST_HORIZONS_MINUTES
+            ),
+            "temperature": [],
+            "humidity": []
+        }
+
+    from datetime import timezone
+
+    def timestamp_seconds(value):
+        dt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.timestamp()
+
+    temp_points = []
+    humidity_points = []
+
+    for row in rows:
+        try:
+            ts = timestamp_seconds(
+                row["created_at"]
+            )
+
+            temp_points.append(
+                (
+                    ts,
+                    float(row["temperature"])
+                )
+            )
+
+            humidity_points.append(
+                (
+                    ts,
+                    float(row["humidity"])
+                )
+            )
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(temp_points) < 2:
+        return {
+            "status": "insufficient_data",
+            "samples": len(temp_points),
+            "required_samples": 2,
+            "forecast_minutes": list(
+                FORECAST_HORIZONS_MINUTES
+            ),
+            "temperature": [],
+            "humidity": []
+        }
+
+    latest_temp = temp_points[-1][1]
+    latest_humidity = humidity_points[-1][1]
+
+    forecasts_temperature = []
+    forecasts_humidity = []
+
+    for minutes in FORECAST_HORIZONS_MINUTES:
+
+        seconds = minutes * 60
+
+        predicted_temp = linear_forecast(
+            temp_points,
+            seconds
+        )
+
+        predicted_humidity = linear_forecast(
+            humidity_points,
+            seconds
+        )
+
+        forecasts_temperature.append({
+            "minutes_ahead": minutes,
+            "value": round(
+                float(predicted_temp),
+                2
+            )
+        })
+
+        forecasts_humidity.append({
+            "minutes_ahead": minutes,
+            "value": round(
+                float(predicted_humidity),
+                2
+            )
+        })
+
+    # Determine simple warnings based on the same environmental
+    # thresholds already used by the alert system.
+    temp_warning = any(
+        item["value"] < TEMP_MIN or
+        item["value"] > TEMP_MAX
+        for item in forecasts_temperature
+    )
+
+    humidity_warning = any(
+        item["value"] < HUM_MIN or
+        item["value"] > HUM_MAX
+        for item in forecasts_humidity
+    )
+
+    return {
+        "status": "ok",
+        "samples": len(temp_points),
+        "sample_window_minutes": round(
+            (
+                temp_points[-1][0] -
+                temp_points[0][0]
+            ) / 60,
+            2
+        ),
+        "generated_at": datetime.now().isoformat(),
+        "current": {
+            "temperature": round(
+                latest_temp,
+                2
+            ),
+            "humidity": round(
+                latest_humidity,
+                2
+            )
+        },
+        "forecast": {
+            "temperature": forecasts_temperature,
+            "humidity": forecasts_humidity
+        },
+        "warnings": {
+            "temperature": temp_warning,
+            "humidity": humidity_warning
+        }
+    }
+
+
+@app.route(
+    "/api/forecast",
+    methods=["GET"]
+)
+def api_forecast():
+
+    try:
+        result = get_environment_forecast()
+
+        return jsonify(
+            result
+        ), 200
+
+    except Exception as e:
+
+        log.exception(
+            "Forecast generation failed: %s",
+            e
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "Could not generate environmental forecast",
+            "details": str(e)
+        }), 503
+
+
+# ============================================================
 # SENSOR HISTORY
 # ============================================================
 
@@ -1597,6 +1849,22 @@ def api_ingest():
         "sensor_update",
         dict(current_data)
     )
+
+    # Generate and broadcast a forecast after the database update.
+    # Forecast errors must never prevent the sensor update from succeeding.
+    try:
+        forecast = get_environment_forecast()
+
+        socketio.emit(
+            "environment_forecast",
+            forecast
+        )
+
+    except Exception as e:
+        log.warning(
+            "Forecast update skipped: %s",
+            e
+        )
 
     log.info(
         "5-SECOND UPDATE: DB saved id=%s | dashboard updated | "
