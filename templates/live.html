@@ -568,7 +568,10 @@
                 max-height: 280px;
             }
         }
-    </style>
+    
+.logout-btn{width:100%;margin-bottom:10px;padding:9px 12px;border:1px solid var(--card-border,#dbe7f5);border-radius:10px;background:#fff;color:#b42318;font:700 .72rem Inter,Arial,sans-serif;cursor:pointer;transition:all .2s ease;text-align:left;}
+.logout-btn:hover{background:#fff1f2;border-color:#fecdd3;transform:translateY(-1px);}
+</style>
 </head>
 <body>
 
@@ -595,6 +598,7 @@
         </nav>
 
         <div class="sidebar-footer">
+    <button class="logout-btn" id="logoutBtn" type="button">↪ Logout</button>
             <div class="status-indicator">
                 <span class="dot"></span>
                 <span id="conn-status">Online</span>
@@ -712,6 +716,30 @@
 
     <!-- ===== SCRIPT ===== -->
     <script>
+
+// ===== AUTHENTICATION =====
+async function authFetch(url, options = {}) {
+  const response = await window.fetch(url, options);
+  if (response.status === 401) {
+    window.location.replace('/login');
+  }
+  return response;
+}
+
+async function logout() {
+  const btn = document.getElementById('logoutBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Logging out…'; }
+  try {
+    await window.fetch('/api/logout', { method: 'POST' });
+  } catch (e) {
+    console.error('Logout error:', e);
+  } finally {
+    window.location.replace('/login');
+  }
+}
+
+document.getElementById('logoutBtn')?.addEventListener('click', logout);
+
         const socket = io();
 
         // ===== SIDEBAR TOGGLE =====
