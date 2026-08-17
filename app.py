@@ -7,6 +7,7 @@ import queue
 import threading
 import logging
 from datetime import datetime
+from functools import wraps
 
 # IMPORTANT:
 # This application runs under Gunicorn's geventwebsocket worker.
@@ -26,7 +27,7 @@ except Exception as e:
 
 import requests
 
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, redirect, make_response
 from flask_socketio import SocketIO
 from dotenv import load_dotenv
 
@@ -105,6 +106,279 @@ else:
     log.warning(
         "SUPABASE_URL/KEY not set — running without database"
     )
+
+
+# ============================================================
+# AUTHENTICATION / SESSION
+# ============================================================
+
+AUTH_COOKIE_NAME = "sb_access_token"
+AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+
+
+def supabase_auth_user(access_token):
+    """Validate a Supabase access token and return the authenticated user."""
+    if not access_token or not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+
+    try:
+        response = requests.get(
+            f"{SUPABASE_URL.rstrip('/')}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        log.warning(
+            "AUTH: Supabase rejected token with HTTP %s",
+            response.status_code,
+        )
+    except requests.RequestException as e:
+        log.error("AUTH: token validation failed: %s", e)
+
+    return None
+
+
+def authenticate_request():
+    """Validate the access token and refresh it automatically when needed."""
+    access_token = request.cookies.get(AUTH_COOKIE_NAME)
+    refresh_token = request.cookies.get("sb_refresh_token")
+
+    user = supabase_auth_user(access_token)
+    if user is not None:
+        return user, None, None
+
+    if not refresh_token or not SUPABASE_URL or not SUPABASE_KEY:
+        return None, None, None
+
+    try:
+        response = requests.post(
+            f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=refresh_token",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Content-Type": "application/json",
+            },
+            json={"refresh_token": refresh_token},
+            timeout=15,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            new_access = data.get("access_token")
+            new_refresh = data.get("refresh_token") or refresh_token
+            user = data.get("user") or supabase_auth_user(new_access)
+            if new_access and user:
+                log.info("AUTH: access token refreshed for authenticated session")
+                return user, new_access, new_refresh
+    except (requests.RequestException, ValueError) as e:
+        log.warning("AUTH: refresh failed: %s", e)
+
+    return None, None, None
+
+
+def current_user():
+    """Return the authenticated user for this request, if any."""
+    user, _, _ = authenticate_request()
+    return user
+
+
+def _set_auth_cookies(response_out, access_token=None, refresh_token=None):
+    secure_cookie = request.is_secure or bool(os.getenv("RENDER"))
+    if access_token:
+        response_out.set_cookie(
+            AUTH_COOKIE_NAME,
+            access_token,
+            max_age=AUTH_COOKIE_MAX_AGE,
+            httponly=True,
+            secure=secure_cookie,
+            samesite="Lax",
+            path="/",
+        )
+    if refresh_token:
+        response_out.set_cookie(
+            "sb_refresh_token",
+            refresh_token,
+            max_age=AUTH_COOKIE_MAX_AGE,
+            httponly=True,
+            secure=secure_cookie,
+            samesite="Lax",
+            path="/",
+        )
+
+
+def login_required(view):
+    """Protect browser pages and user-facing API endpoints."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user, refreshed_access, refreshed_refresh = authenticate_request()
+        if user is None:
+            if request.path.startswith("/api/") or request.path == "/video_feed":
+                return jsonify({
+                    "status": "error",
+                    "error": "Authentication required",
+                    "redirect": "/login",
+                }), 401
+            return redirect("/login")
+
+        request.auth_user = user
+        request.auth_refreshed_access = refreshed_access
+        request.auth_refreshed_refresh = refreshed_refresh
+
+        result = view(*args, **kwargs)
+        if refreshed_access:
+            response_out = make_response(result)
+            _set_auth_cookies(
+                response_out,
+                refreshed_access,
+                refreshed_refresh,
+            )
+            return response_out
+        return result
+
+    return wrapped
+
+
+# ============================================================
+# LOGIN / LOGOUT
+# ============================================================
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    if current_user() is not None:
+        return redirect("/")
+    return render_template("login.html")
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip()
+    password = str(data.get("password", ""))
+
+    if not email or not password:
+        return jsonify({
+            "status": "error",
+            "message": "Email and password are required.",
+        }), 400
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.error("AUTH: SUPABASE_URL or SUPABASE_KEY is missing")
+        return jsonify({
+            "status": "error",
+            "message": "Authentication is not configured on the server.",
+        }), 503
+
+    try:
+        response = requests.post(
+            f"{SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Content-Type": "application/json",
+            },
+            json={"email": email, "password": password},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        log.error("AUTH: Supabase login request failed: %s", e)
+        return jsonify({
+            "status": "error",
+            "message": "Unable to contact the authentication service.",
+        }), 503
+
+    if response.status_code != 200:
+        try:
+            error_data = response.json()
+        except ValueError:
+            error_data = {}
+
+        # Do not expose raw Supabase authentication details.
+        log.warning(
+            "AUTH: login rejected for %s with HTTP %s",
+            email,
+            response.status_code,
+        )
+        return jsonify({
+            "status": "error",
+            "message": "Invalid email or password.",
+        }), 401
+
+    try:
+        auth_data = response.json()
+        access_token = auth_data.get("access_token")
+        refresh_token = auth_data.get("refresh_token")
+        user = auth_data.get("user") or {}
+    except ValueError:
+        access_token = None
+        refresh_token = None
+        user = {}
+
+    if not access_token:
+        log.error("AUTH: Supabase login returned no access token")
+        return jsonify({
+            "status": "error",
+            "message": "Login could not be completed.",
+        }), 502
+
+    response_out = make_response(jsonify({
+        "status": "ok",
+        "message": "Login successful",
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+        },
+    }))
+
+    # Keep both tokens in HttpOnly cookies so browser JavaScript never
+    # needs to handle Supabase access or refresh tokens directly.
+    _set_auth_cookies(response_out, access_token, refresh_token)
+
+    return response_out, 200
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    access_token = request.cookies.get(AUTH_COOKIE_NAME)
+
+    # Best-effort Supabase sign-out. Clearing the local cookies is what
+    # guarantees that this browser can no longer access protected routes.
+    if access_token and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            requests.post(
+                f"{SUPABASE_URL.rstrip('/')}/auth/v1/logout",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {access_token}",
+                },
+                timeout=10,
+            )
+        except requests.RequestException as e:
+            log.warning("AUTH: remote logout failed: %s", e)
+
+    response_out = make_response(jsonify({
+        "status": "ok",
+        "message": "Logged out successfully",
+    }))
+    response_out.delete_cookie(AUTH_COOKIE_NAME, path="/")
+    response_out.delete_cookie("sb_refresh_token", path="/")
+    return response_out, 200
+
+
+@app.route("/api/me", methods=["GET"])
+@login_required
+def api_me():
+    user = request.auth_user
+    return jsonify({
+        "status": "ok",
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+        },
+    })
 
 
 # ============================================================
@@ -1158,6 +1432,7 @@ def _process_reading_async(
 # ============================================================
 
 @app.route("/")
+@login_required
 def index():
 
     return render_template(
@@ -1170,6 +1445,7 @@ def index():
 # ============================================================
 
 @app.route("/live")
+@login_required
 def live():
 
     return render_template(
@@ -1182,6 +1458,7 @@ def live():
 # ============================================================
 
 @app.route("/history")
+@login_required
 def history():
 
     return render_template(
@@ -1196,6 +1473,7 @@ def history():
 @app.route(
     "/api/current_data"
 )
+@login_required
 def api_current_data():
 
     return jsonify(
@@ -1211,6 +1489,7 @@ def api_current_data():
     "/api/db_health",
     methods=["GET"]
 )
+@login_required
 def api_db_health():
 
     if supabase is None:
@@ -1258,6 +1537,7 @@ def api_db_health():
     "/api/email_status",
     methods=["GET"]
 )
+@login_required
 def api_email_status():
 
     """
@@ -1277,6 +1557,7 @@ def api_email_status():
     "/api/test_email",
     methods=["POST"]
 )
+@login_required
 def api_test_email():
 
     """
@@ -1547,6 +1828,7 @@ def get_environment_forecast():
     "/api/forecast",
     methods=["GET"]
 )
+@login_required
 def api_forecast():
 
     try:
@@ -1577,6 +1859,7 @@ def api_forecast():
 @app.route(
     "/api/history"
 )
+@login_required
 def api_history():
 
     if supabase is None:
@@ -1631,6 +1914,7 @@ def api_history():
 @app.route(
     "/api/alerts"
 )
+@login_required
 def api_alerts():
 
     if supabase is None:
@@ -1686,6 +1970,7 @@ def api_alerts():
     "/api/clear_alerts",
     methods=["POST"]
 )
+@login_required
 def clear_alerts():
 
     if supabase is None:
@@ -1971,6 +2256,7 @@ def api_upload_frame():
 @app.route(
     "/video_feed"
 )
+@login_required
 def video_feed():
 
     """
@@ -2060,6 +2346,7 @@ def video_feed():
     "/api/chat",
     methods=["POST"]
 )
+@login_required
 def api_chat():
 
     data = request.get_json(
