@@ -552,19 +552,18 @@ def send_alert_email_async(alerts):
 # ALERT STATE
 # ============================================================
 
-# Email confirmation rule:
-# ONLY temperature or wetness conditions are confirmed for email.
-# The same condition must be detected in three consecutive stored
-# 5-second readings before an email is sent.
-CONSECUTIVE_ALERT_REQUIRED = 3
+# EMAIL RULE:
+# Send an email immediately when:
+#   1. Temperature is outside the configured range, OR
+#   2. The diaper is wet.
+#
+# There is NO 3-consecutive-reading requirement.
+#
+# A condition is latched after the first email so the system does
+# not send the same email every 5 seconds while the condition remains
+# active. The latch resets when that condition returns to normal.
 
 _alert_lock = threading.Lock()
-
-_condition_counts = {
-    "temperature_high": 0,
-    "temperature_low": 0,
-    "wetness": 0,
-}
 
 _condition_latched = {
     "temperature_high": False,
@@ -573,31 +572,27 @@ _condition_latched = {
 }
 
 
-def condition_confirmed(condition):
+def condition_should_email(condition):
+    """Return True only on the first detection of an active condition."""
     with _alert_lock:
-        _condition_counts[condition] += 1
-        count = _condition_counts[condition]
 
-        log.info(
-            "ALERT CONFIRMATION: %s detected %d/%d consecutive times",
-            condition,
-            count,
-            CONSECUTIVE_ALERT_REQUIRED
-        )
+        if not _condition_latched[condition]:
 
-        if (
-            count >= CONSECUTIVE_ALERT_REQUIRED
-            and not _condition_latched[condition]
-        ):
             _condition_latched[condition] = True
+
+            log.info(
+                "EMAIL CONDITION DETECTED: %s",
+                condition
+            )
+
             return True
 
         return False
 
 
 def reset_condition(condition):
+    """Allow a future email after the condition becomes normal."""
     with _alert_lock:
-        _condition_counts[condition] = 0
         _condition_latched[condition] = False
 
 
@@ -608,81 +603,86 @@ def reset_condition(condition):
 def check_alerts(
     temp,
     hum,
-    wetness,
-    sound
+    motion,
+    sound,
+    wetness
 ):
     """
-    Emails are generated only after the same condition appears in
-    three consecutive stored readings.
+    Email is sent immediately when temperature is outside the
+    configured range or the diaper is wet.
 
-    With the 5-second database sampler:
-      Reading 1 abnormal -> no email
-      Reading 2 abnormal -> no email
-      Reading 3 abnormal -> email
-      Reading 4+ abnormal -> no duplicate email
-      Condition normal -> reset and allow a future email event
+    There is NO consecutive-reading requirement.
 
-    Only temperature and wetness can trigger an email.
-    Humidity, motion, and sound do not trigger emails.
+    Humidity, motion, and sound do NOT trigger emails.
+
+    A continuous abnormal condition sends one email only. The
+    condition must return to normal before another email can be sent.
     """
 
     confirmed = []
 
-    # ONLY these two conditions can create email alerts:
-    #   1. Temperature is outside the configured safe range.
-    #   2. Diaper/wetness sensor detects a wet diaper.
-    #
-    # Humidity, motion, and sound NEVER trigger an email.
+    # --------------------------------------------------------
+    # TEMPERATURE HIGH
+    # --------------------------------------------------------
 
-    conditions = [
-        (
-            "temperature_high",
-            temp > TEMP_MAX,
-            {
+    if temp > TEMP_MAX:
+
+        if condition_should_email("temperature_high"):
+
+            confirmed.append({
                 "alert_type": "temperature",
                 "severity": "critical",
                 "message": (
                     f"Temperature is too high: {temp:.1f}°C. "
                     f"Configured maximum is {TEMP_MAX:.1f}°C."
                 )
-            }
-        ),
-        (
-            "temperature_low",
-            temp < TEMP_MIN,
-            {
+            })
+
+    else:
+
+        reset_condition("temperature_high")
+
+    # --------------------------------------------------------
+    # TEMPERATURE LOW
+    # --------------------------------------------------------
+
+    if temp < TEMP_MIN:
+
+        if condition_should_email("temperature_low"):
+
+            confirmed.append({
                 "alert_type": "temperature",
                 "severity": "critical",
                 "message": (
                     f"Temperature is too low: {temp:.1f}°C. "
                     f"Configured minimum is {TEMP_MIN:.1f}°C."
                 )
-            }
-        ),
-        (
-            "wetness",
-            bool(wetness),
-            {
+            })
+
+    else:
+
+        reset_condition("temperature_low")
+
+    # --------------------------------------------------------
+    # WET DIAPER
+    # --------------------------------------------------------
+
+    if bool(wetness):
+
+        if condition_should_email("wetness"):
+
+            confirmed.append({
                 "alert_type": "wetness",
                 "severity": "critical",
                 "message": "Diaper is wet! Please change the diaper."
-            }
-        ),
-    ]
+            })
 
-    for condition, detected, alert in conditions:
+    else:
 
-        if detected:
-
-            if condition_confirmed(condition):
-                confirmed.append(alert)
-
-        else:
-
-            reset_condition(condition)
+        reset_condition("wetness")
 
     # --------------------------------------------------------
-    # SAVE ONLY CONFIRMED ALERTS
+    # SAVE ALERT AND SEND EMAIL IMMEDIATELY
     # --------------------------------------------------------
 
     if not confirmed:
@@ -710,20 +710,16 @@ def check_alerts(
             saved_alerts.append(saved)
 
             log.warning(
-                "CONFIRMED ALERT SAVED: %s",
+                "EMAIL ALERT SAVED: %s",
                 alert["message"]
             )
 
         except Exception as e:
 
             log.error(
-                "Failed to save confirmed alert: %s",
+                "Failed to save email alert: %s",
                 e
             )
-
-    # --------------------------------------------------------
-    # EMAIL ONLY FOR CONFIRMED ALERTS
-    # --------------------------------------------------------
 
     if saved_alerts:
 
@@ -734,594 +730,11 @@ def check_alerts(
         ).start()
 
         log.info(
-            "EMAIL QUEUED: confirmed after %d consecutive readings",
-            CONSECUTIVE_ALERT_REQUIRED
+            "EMAIL QUEUED IMMEDIATELY: %d temperature/wetness alert(s)",
+            len(saved_alerts)
         )
 
     return saved_alerts
-
-
-# ============================================================
-# PROCESS SENSOR READING
-# ============================================================
-
-def save_sensor_reading_to_supabase(
-    temp,
-    hum,
-    motion,
-    sound,
-    wetness
-):
-    """
-    Save one sensor reading using the exact PostgreSQL types
-    defined in the sensor_readings table.
-    """
-
-    if supabase is None:
-        raise RuntimeError(
-            "Supabase is not configured. Check SUPABASE_URL and SUPABASE_KEY."
-        )
-
-    # sensor_readings.sound_level is INTEGER.
-    # This guarantees that 0.0 / "0.0" becomes integer 0.
-    reading = {
-        "temperature": float(temp),
-        "humidity": float(hum),
-        "motion_detected": bool(motion),
-        "sound_level": int(float(sound)),
-        "wetness_detected": bool(wetness),
-        "is_abnormal": bool(check_abnormal(float(temp), float(hum)))
-    }
-
-    log.info("Supabase sensor payload: %s", reading)
-
-    response = (
-        supabase
-        .table("sensor_readings")
-        .insert(reading)
-        .execute()
-    )
-
-    if not response.data:
-        raise RuntimeError(
-            "Supabase returned no inserted sensor reading."
-        )
-
-    log.info(
-        "Sensor reading saved to Supabase: id=%s",
-        response.data[0].get("id")
-    )
-
-    return response.data[0]
-
-
-def _process_reading_async(
-    temp,
-    hum,
-    motion,
-    sound,
-    wetness
-):
-    """
-    Process alerts after the sensor reading has already been
-    successfully saved to Supabase.
-    """
-
-    try:
-        check_alerts(
-            temp,
-            hum,
-            wetness,
-            sound
-        )
-    except Exception as e:
-        log.error(
-            "Alert processing error: %s",
-            e
-        )
-
-
-# ============================================================
-# HOME PAGE
-# ============================================================
-
-@app.route("/")
-def index():
-
-    return render_template(
-        "index.html"
-    )
-
-
-# ============================================================
-# LIVE PAGE
-# ============================================================
-
-@app.route("/live")
-def live():
-
-    return render_template(
-        "live.html"
-    )
-
-
-# ============================================================
-# HISTORY PAGE
-# ============================================================
-
-@app.route("/history")
-def history():
-
-    return render_template(
-        "history.html"
-    )
-
-
-# ============================================================
-# CURRENT SENSOR DATA
-# ============================================================
-
-@app.route(
-    "/api/current_data"
-)
-def api_current_data():
-
-    return jsonify(
-        current_data
-    )
-
-
-# ============================================================
-# SUPABASE DATABASE HEALTH CHECK
-# ============================================================
-
-@app.route(
-    "/api/db_health",
-    methods=["GET"]
-)
-def api_db_health():
-
-    if supabase is None:
-        return jsonify({
-            "status": "error",
-            "database": "not_configured",
-            "message": "SUPABASE_URL or SUPABASE_KEY is missing"
-        }), 503
-
-    try:
-
-        supabase.table(
-            "sensor_readings"
-        ).select(
-            "id"
-        ).limit(
-            1
-        ).execute()
-
-        return jsonify({
-            "status": "ok",
-            "database": "connected",
-            "table": "sensor_readings"
-        }), 200
-
-    except Exception as e:
-
-        log.error(
-            "Supabase health check failed: %s",
-            e
-        )
-
-        return jsonify({
-            "status": "error",
-            "database": "unavailable",
-            "details": str(e)
-        }), 503
-
-
-# ============================================================
-# EMAIL CONFIGURATION / TEST
-# ============================================================
-
-@app.route(
-    "/api/email_status",
-    methods=["GET"]
-)
-def api_email_status():
-
-    """
-    Safe diagnostic endpoint. It reports configuration status
-    without exposing the Bird API key.
-    """
-
-    status = email_configuration_status()
-
-    return jsonify({
-        "status": "ok",
-        "email": status
-    }), 200
-
-
-@app.route(
-    "/api/test_email",
-    methods=["POST"]
-)
-def api_test_email():
-
-    """
-    Send a controlled test email without requiring a sensor alert.
-
-    This is intended for debugging the Bird configuration.
-    """
-
-    test_alert = [{
-        "alert_type": "test",
-        "severity": "warning",
-        "message": "This is a test email from the Baby Monitoring System."
-    }]
-
-    success = send_alert_email(
-        test_alert
-    )
-
-    if success:
-        return jsonify({
-            "status": "ok",
-            "message": "Bird accepted the test email",
-            "recipient": ALERT_EMAIL
-        }), 200
-
-    return jsonify({
-        "status": "error",
-        "message": "Bird did not accept the test email. Check Render logs.",
-        "configuration": email_configuration_status()
-    }), 502
-
-
-# ============================================================
-# BASIC ENVIRONMENTAL FORECASTING
-# ============================================================
-
-# Forecasts use the most recent stored readings. Because the system
-# stores one reading every 5 seconds, 60 samples represent 5 minutes.
-FORECAST_SAMPLE_COUNT = 60
-FORECAST_HORIZONS_MINUTES = (5, 10, 15)
-
-# Use the same environmental limits as the alert system.
-# These were previously read directly inside alert functions, but the
-# forecasting code also needs them when deciding whether a prediction
-# is outside the normal range.
-TEMP_MIN = float(os.getenv("TEMP_MIN", "20"))
-TEMP_MAX = float(os.getenv("TEMP_MAX", "25"))
-HUM_MIN = float(os.getenv("HUM_MIN", "40"))
-HUM_MAX = float(os.getenv("HUM_MAX", "60"))
-
-
-# ============================================================
-# TEMPERATURE / HUMIDITY ABNORMALITY CHECK
-# ============================================================
-
-def check_abnormal(temp, hum):
-    """
-    Return True when temperature or humidity is outside the
-    configured safe operating range.
-
-    Uses the same thresholds as the alert and forecasting systems.
-    None values are ignored so status/forecast calls do not crash.
-    """
-
-    if temp is not None:
-        try:
-            temp_value = float(temp)
-            if temp_value < TEMP_MIN or temp_value > TEMP_MAX:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-    if hum is not None:
-        try:
-            hum_value = float(hum)
-            if hum_value < HUM_MIN or hum_value > HUM_MAX:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-    return False
-
-
-def linear_forecast(points, horizon_seconds):
-    """
-    Simple least-squares linear trend forecast.
-
-    points:
-        list of (timestamp_seconds, value)
-
-    Returns the predicted value at the requested future horizon.
-    """
-    if len(points) < 2:
-        return None
-
-    xs = [float(p[0]) for p in points]
-    ys = [float(p[1]) for p in points]
-
-    n = len(xs)
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-
-    denominator = sum(
-        (x - mean_x) ** 2
-        for x in xs
-    )
-
-    if denominator == 0:
-        return mean_y
-
-    slope = sum(
-        (x - mean_x) * (y - mean_y)
-        for x, y in zip(xs, ys)
-    ) / denominator
-
-    intercept = mean_y - slope * mean_x
-
-    future_x = xs[-1] + float(horizon_seconds)
-
-    return intercept + slope * future_x
-
-
-def get_environment_forecast():
-    """
-    Retrieve recent environmental readings from Supabase and
-    produce basic linear forecasts for temperature and humidity.
-
-    This is intentionally a simple baseline forecast suitable for
-    a project-level 'basic forecasting analytics' requirement.
-    """
-
-    if supabase is None:
-        raise RuntimeError("Supabase is not configured.")
-
-    response = (
-        supabase
-        .table("sensor_readings")
-        .select(
-            "temperature,humidity,created_at"
-        )
-        .order(
-            "created_at",
-            desc=True
-        )
-        .limit(
-            FORECAST_SAMPLE_COUNT
-        )
-        .execute()
-    )
-
-    rows = list(reversed(response.data or []))
-
-    if len(rows) < 2:
-        return {
-            "status": "insufficient_data",
-            "samples": len(rows),
-            "required_samples": 2,
-            "forecast_minutes": list(
-                FORECAST_HORIZONS_MINUTES
-            ),
-            "temperature": [],
-            "humidity": []
-        }
-
-    from datetime import timezone
-
-    def timestamp_seconds(value):
-        dt = datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
-
-        if dt.tzinfo is None:
-            dt = dt.replace(
-                tzinfo=timezone.utc
-            )
-
-        return dt.timestamp()
-
-    temp_points = []
-    humidity_points = []
-
-    for row in rows:
-        try:
-            ts = timestamp_seconds(
-                row["created_at"]
-            )
-
-            temp_points.append(
-                (
-                    ts,
-                    float(row["temperature"])
-                )
-            )
-
-            humidity_points.append(
-                (
-                    ts,
-                    float(row["humidity"])
-                )
-            )
-
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    if len(temp_points) < 2:
-        return {
-            "status": "insufficient_data",
-            "samples": len(temp_points),
-            "required_samples": 2,
-            "forecast_minutes": list(
-                FORECAST_HORIZONS_MINUTES
-            ),
-            "temperature": [],
-            "humidity": []
-        }
-
-    latest_temp = temp_points[-1][1]
-    latest_humidity = humidity_points[-1][1]
-
-    forecasts_temperature = []
-    forecasts_humidity = []
-
-    for minutes in FORECAST_HORIZONS_MINUTES:
-
-        seconds = minutes * 60
-
-        predicted_temp = linear_forecast(
-            temp_points,
-            seconds
-        )
-
-        predicted_humidity = linear_forecast(
-            humidity_points,
-            seconds
-        )
-
-        forecasts_temperature.append({
-            "minutes_ahead": minutes,
-            "value": round(
-                float(predicted_temp),
-                2
-            )
-        })
-
-        forecasts_humidity.append({
-            "minutes_ahead": minutes,
-            "value": round(
-                float(predicted_humidity),
-                2
-            )
-        })
-
-    # Determine simple warnings based on the same environmental
-    # thresholds already used by the alert system.
-    temp_warning = any(
-        item["value"] < TEMP_MIN or
-        item["value"] > TEMP_MAX
-        for item in forecasts_temperature
-    )
-
-    humidity_warning = any(
-        item["value"] < HUM_MIN or
-        item["value"] > HUM_MAX
-        for item in forecasts_humidity
-    )
-
-    return {
-        "status": "ok",
-        "samples": len(temp_points),
-        "sample_window_minutes": round(
-            (
-                temp_points[-1][0] -
-                temp_points[0][0]
-            ) / 60,
-            2
-        ),
-        "generated_at": datetime.now().isoformat(),
-        "current": {
-            "temperature": round(
-                latest_temp,
-                2
-            ),
-            "humidity": round(
-                latest_humidity,
-                2
-            )
-        },
-        "forecast": {
-            "temperature": forecasts_temperature,
-            "humidity": forecasts_humidity
-        },
-        "warnings": {
-            "temperature": temp_warning,
-            "humidity": humidity_warning
-        }
-    }
-
-
-@app.route(
-    "/api/forecast",
-    methods=["GET"]
-)
-def api_forecast():
-
-    try:
-        result = get_environment_forecast()
-
-        return jsonify(
-            result
-        ), 200
-
-    except Exception as e:
-
-        log.exception(
-            "Forecast generation failed: %s",
-            e
-        )
-
-        return jsonify({
-            "status": "error",
-            "error": "Could not generate environmental forecast",
-            "details": str(e)
-        }), 503
-
-
-# ============================================================
-# SENSOR HISTORY
-# ============================================================
-
-@app.route(
-    "/api/history"
-)
-def api_history():
-
-    if supabase is None:
-
-        return jsonify([])
-
-
-    limit = request.args.get(
-        "limit",
-        100,
-        type=int
-    )
-
-
-    try:
-
-        response = (
-
-            supabase
-            .table("sensor_readings")
-            .select("*")
-            .order(
-                "created_at",
-                desc=True
-            )
-            .limit(limit)
-            .execute()
-        )
-
-
-        return jsonify(
-            response.data
-        )
-
-
-    except Exception as e:
-
-        log.error(
-            "History error: %s",
-            e
-        )
-
-        return jsonify({
-            "error": str(e)
-        }), 500
 
 
 # ============================================================
