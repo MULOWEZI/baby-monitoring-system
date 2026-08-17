@@ -611,9 +611,8 @@ def reset_condition(condition):
 def check_alerts(
     temp,
     hum,
-    motion,
-    sound,
-    wetness
+    wetness,
+    sound
 ):
     """
     Emails are generated only after the same condition appears in
@@ -757,6 +756,557 @@ def check_alerts(
         )
 
     return saved_alerts
+
+
+# ============================================================
+# PROCESS SENSOR READING
+# ============================================================
+
+def save_sensor_reading_to_supabase(
+    temp,
+    hum,
+    motion,
+    sound,
+    wetness
+):
+    """
+    Save one sensor reading using the exact PostgreSQL types
+    defined in the sensor_readings table.
+    """
+
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase is not configured. Check SUPABASE_URL and SUPABASE_KEY."
+        )
+
+    # sensor_readings.sound_level is INTEGER.
+    # This guarantees that 0.0 / "0.0" becomes integer 0.
+    reading = {
+        "temperature": float(temp),
+        "humidity": float(hum),
+        "motion_detected": bool(motion),
+        "sound_level": int(float(sound)),
+        "wetness_detected": bool(wetness),
+        "is_abnormal": bool(check_abnormal(float(temp), float(hum)))
+    }
+
+    log.info("Supabase sensor payload: %s", reading)
+
+    response = (
+        supabase
+        .table("sensor_readings")
+        .insert(reading)
+        .execute()
+    )
+
+    if not response.data:
+        raise RuntimeError(
+            "Supabase returned no inserted sensor reading."
+        )
+
+    log.info(
+        "Sensor reading saved to Supabase: id=%s",
+        response.data[0].get("id")
+    )
+
+    return response.data[0]
+
+
+def _process_reading_async(
+    temp,
+    hum,
+    motion,
+    sound,
+    wetness
+):
+    """
+    Process alerts after the sensor reading has already been
+    successfully saved to Supabase.
+    """
+
+    try:
+        check_alerts(
+            temp,
+            hum,
+            wetness,
+            sound
+        )
+    except Exception as e:
+        log.error(
+            "Alert processing error: %s",
+            e
+        )
+
+
+# ============================================================
+# HOME PAGE
+# ============================================================
+
+@app.route("/")
+def index():
+
+    return render_template(
+        "index.html"
+    )
+
+
+# ============================================================
+# LIVE PAGE
+# ============================================================
+
+@app.route("/live")
+def live():
+
+    return render_template(
+        "live.html"
+    )
+
+
+# ============================================================
+# HISTORY PAGE
+# ============================================================
+
+@app.route("/history")
+def history():
+
+    return render_template(
+        "history.html"
+    )
+
+
+# ============================================================
+# CURRENT SENSOR DATA
+# ============================================================
+
+@app.route(
+    "/api/current_data"
+)
+def api_current_data():
+
+    return jsonify(
+        current_data
+    )
+
+
+# ============================================================
+# SUPABASE DATABASE HEALTH CHECK
+# ============================================================
+
+@app.route(
+    "/api/db_health",
+    methods=["GET"]
+)
+def api_db_health():
+
+    if supabase is None:
+        return jsonify({
+            "status": "error",
+            "database": "not_configured",
+            "message": "SUPABASE_URL or SUPABASE_KEY is missing"
+        }), 503
+
+    try:
+
+        supabase.table(
+            "sensor_readings"
+        ).select(
+            "id"
+        ).limit(
+            1
+        ).execute()
+
+        return jsonify({
+            "status": "ok",
+            "database": "connected",
+            "table": "sensor_readings"
+        }), 200
+
+    except Exception as e:
+
+        log.error(
+            "Supabase health check failed: %s",
+            e
+        )
+
+        return jsonify({
+            "status": "error",
+            "database": "unavailable",
+            "details": str(e)
+        }), 503
+
+
+# ============================================================
+# EMAIL CONFIGURATION / TEST
+# ============================================================
+
+@app.route(
+    "/api/email_status",
+    methods=["GET"]
+)
+def api_email_status():
+
+    """
+    Safe diagnostic endpoint. It reports configuration status
+    without exposing the Bird API key.
+    """
+
+    status = email_configuration_status()
+
+    return jsonify({
+        "status": "ok",
+        "email": status
+    }), 200
+
+
+@app.route(
+    "/api/test_email",
+    methods=["POST"]
+)
+def api_test_email():
+
+    """
+    Send a controlled test email without requiring a sensor alert.
+
+    This is intended for debugging the Bird configuration.
+    """
+
+    test_alert = [{
+        "alert_type": "test",
+        "severity": "warning",
+        "message": "This is a test email from the Baby Monitoring System."
+    }]
+
+    success = send_alert_email(
+        test_alert
+    )
+
+    if success:
+        return jsonify({
+            "status": "ok",
+            "message": "Bird accepted the test email",
+            "recipient": ALERT_EMAIL
+        }), 200
+
+    return jsonify({
+        "status": "error",
+        "message": "Bird did not accept the test email. Check Render logs.",
+        "configuration": email_configuration_status()
+    }), 502
+
+
+# ============================================================
+# BASIC ENVIRONMENTAL FORECASTING
+# ============================================================
+
+# Forecasts use the most recent stored readings. Because the system
+# stores one reading every 5 seconds, 60 samples represent 5 minutes.
+FORECAST_SAMPLE_COUNT = 60
+FORECAST_HORIZONS_MINUTES = (5, 10, 15)
+
+# Use the same environmental limits as the alert system.
+# These were previously read directly inside alert functions, but the
+# forecasting code also needs them when deciding whether a prediction
+# is outside the normal range.
+TEMP_MIN = float(os.getenv("TEMP_MIN", "20"))
+TEMP_MAX = float(os.getenv("TEMP_MAX", "25"))
+HUM_MIN = float(os.getenv("HUM_MIN", "40"))
+HUM_MAX = float(os.getenv("HUM_MAX", "60"))
+
+
+def linear_forecast(points, horizon_seconds):
+    """
+    Simple least-squares linear trend forecast.
+
+    points:
+        list of (timestamp_seconds, value)
+
+    Returns the predicted value at the requested future horizon.
+    """
+    if len(points) < 2:
+        return None
+
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+
+    denominator = sum(
+        (x - mean_x) ** 2
+        for x in xs
+    )
+
+    if denominator == 0:
+        return mean_y
+
+    slope = sum(
+        (x - mean_x) * (y - mean_y)
+        for x, y in zip(xs, ys)
+    ) / denominator
+
+    intercept = mean_y - slope * mean_x
+
+    future_x = xs[-1] + float(horizon_seconds)
+
+    return intercept + slope * future_x
+
+
+def get_environment_forecast():
+    """
+    Retrieve recent environmental readings from Supabase and
+    produce basic linear forecasts for temperature and humidity.
+
+    This is intentionally a simple baseline forecast suitable for
+    a project-level 'basic forecasting analytics' requirement.
+    """
+
+    if supabase is None:
+        raise RuntimeError("Supabase is not configured.")
+
+    response = (
+        supabase
+        .table("sensor_readings")
+        .select(
+            "temperature,humidity,created_at"
+        )
+        .order(
+            "created_at",
+            desc=True
+        )
+        .limit(
+            FORECAST_SAMPLE_COUNT
+        )
+        .execute()
+    )
+
+    rows = list(reversed(response.data or []))
+
+    if len(rows) < 2:
+        return {
+            "status": "insufficient_data",
+            "samples": len(rows),
+            "required_samples": 2,
+            "forecast_minutes": list(
+                FORECAST_HORIZONS_MINUTES
+            ),
+            "temperature": [],
+            "humidity": []
+        }
+
+    from datetime import timezone
+
+    def timestamp_seconds(value):
+        dt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.timestamp()
+
+    temp_points = []
+    humidity_points = []
+
+    for row in rows:
+        try:
+            ts = timestamp_seconds(
+                row["created_at"]
+            )
+
+            temp_points.append(
+                (
+                    ts,
+                    float(row["temperature"])
+                )
+            )
+
+            humidity_points.append(
+                (
+                    ts,
+                    float(row["humidity"])
+                )
+            )
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(temp_points) < 2:
+        return {
+            "status": "insufficient_data",
+            "samples": len(temp_points),
+            "required_samples": 2,
+            "forecast_minutes": list(
+                FORECAST_HORIZONS_MINUTES
+            ),
+            "temperature": [],
+            "humidity": []
+        }
+
+    latest_temp = temp_points[-1][1]
+    latest_humidity = humidity_points[-1][1]
+
+    forecasts_temperature = []
+    forecasts_humidity = []
+
+    for minutes in FORECAST_HORIZONS_MINUTES:
+
+        seconds = minutes * 60
+
+        predicted_temp = linear_forecast(
+            temp_points,
+            seconds
+        )
+
+        predicted_humidity = linear_forecast(
+            humidity_points,
+            seconds
+        )
+
+        forecasts_temperature.append({
+            "minutes_ahead": minutes,
+            "value": round(
+                float(predicted_temp),
+                2
+            )
+        })
+
+        forecasts_humidity.append({
+            "minutes_ahead": minutes,
+            "value": round(
+                float(predicted_humidity),
+                2
+            )
+        })
+
+    # Determine simple warnings based on the same environmental
+    # thresholds already used by the alert system.
+    temp_warning = any(
+        item["value"] < TEMP_MIN or
+        item["value"] > TEMP_MAX
+        for item in forecasts_temperature
+    )
+
+    humidity_warning = any(
+        item["value"] < HUM_MIN or
+        item["value"] > HUM_MAX
+        for item in forecasts_humidity
+    )
+
+    return {
+        "status": "ok",
+        "samples": len(temp_points),
+        "sample_window_minutes": round(
+            (
+                temp_points[-1][0] -
+                temp_points[0][0]
+            ) / 60,
+            2
+        ),
+        "generated_at": datetime.now().isoformat(),
+        "current": {
+            "temperature": round(
+                latest_temp,
+                2
+            ),
+            "humidity": round(
+                latest_humidity,
+                2
+            )
+        },
+        "forecast": {
+            "temperature": forecasts_temperature,
+            "humidity": forecasts_humidity
+        },
+        "warnings": {
+            "temperature": temp_warning,
+            "humidity": humidity_warning
+        }
+    }
+
+
+@app.route(
+    "/api/forecast",
+    methods=["GET"]
+)
+def api_forecast():
+
+    try:
+        result = get_environment_forecast()
+
+        return jsonify(
+            result
+        ), 200
+
+    except Exception as e:
+
+        log.exception(
+            "Forecast generation failed: %s",
+            e
+        )
+
+        return jsonify({
+            "status": "error",
+            "error": "Could not generate environmental forecast",
+            "details": str(e)
+        }), 503
+
+
+# ============================================================
+# SENSOR HISTORY
+# ============================================================
+
+@app.route(
+    "/api/history"
+)
+def api_history():
+
+    if supabase is None:
+
+        return jsonify([])
+
+
+    limit = request.args.get(
+        "limit",
+        100,
+        type=int
+    )
+
+
+    try:
+
+        response = (
+
+            supabase
+            .table("sensor_readings")
+            .select("*")
+            .order(
+                "created_at",
+                desc=True
+            )
+            .limit(limit)
+            .execute()
+        )
+
+
+        return jsonify(
+            response.data
+        )
+
+
+    except Exception as e:
+
+        log.error(
+            "History error: %s",
+            e
+        )
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 
 # ============================================================
