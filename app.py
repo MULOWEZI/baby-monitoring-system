@@ -1318,6 +1318,15 @@ def api_test_email():
 FORECAST_SAMPLE_COUNT = 60
 FORECAST_HORIZONS_MINUTES = (5, 10, 15)
 
+# Use the same environmental limits as the alert system.
+# These were previously read directly inside alert functions, but the
+# forecasting code also needs them when deciding whether a prediction
+# is outside the normal range.
+TEMP_MIN = float(os.getenv("TEMP_MIN", "20"))
+TEMP_MAX = float(os.getenv("TEMP_MAX", "25"))
+HUM_MIN = float(os.getenv("HUM_MIN", "40"))
+HUM_MAX = float(os.getenv("HUM_MAX", "60"))
+
 
 def linear_forecast(points, horizon_seconds):
     """
