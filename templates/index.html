@@ -459,7 +459,7 @@ async function loadHistory(){
 
 async function loadAlerts(){
   try{
-    const response = await authFetch('/api/alerts?limit=20');
+    const response = await authFetch('/api/alerts?limit=5');
     const alerts = await response.json();
     const alertsList = document.getElementById('alerts-list');
     const alertCount = document.getElementById('alert-count');
