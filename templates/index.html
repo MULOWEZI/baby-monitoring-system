@@ -155,6 +155,9 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
   .chart-wrap{height:200px;}
   .chat-messages{height:145px;}
 }
+
+.logout-btn{width:100%;margin-bottom:10px;padding:9px 12px;border:1px solid var(--card-border,#dbe7f5);border-radius:10px;background:#fff;color:#b42318;font:700 .72rem Inter,Arial,sans-serif;cursor:pointer;transition:all .2s ease;text-align:left;}
+.logout-btn:hover{background:#fff1f2;border-color:#fecdd3;transform:translateY(-1px);}
 </style>
 </head>
 <body>
@@ -170,6 +173,7 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
     <a href="/history" class="nav-link"><i>📈</i> History</a>
   </nav>
   <div class="sidebar-footer">
+    <button class="logout-btn" id="logoutBtn" type="button">↪ Logout</button>
     <div class="status-indicator" id="conn-indicator"><span class="dot"></span><span id="conn-status">Connecting…</span></div>
     <div class="version">v3.0.0</div>
   </div>
@@ -270,6 +274,30 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
 </main>
 
 <script>
+
+// ===== AUTHENTICATION =====
+async function authFetch(url, options = {}) {
+  const response = await window.fetch(url, options);
+  if (response.status === 401) {
+    window.location.replace('/login');
+  }
+  return response;
+}
+
+async function logout() {
+  const btn = document.getElementById('logoutBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Logging out…'; }
+  try {
+    await window.fetch('/api/logout', { method: 'POST' });
+  } catch (e) {
+    console.error('Logout error:', e);
+  } finally {
+    window.location.replace('/login');
+  }
+}
+
+document.getElementById('logoutBtn')?.addEventListener('click', logout);
+
 const socket = io();
 let lastUpdateTs = null;
 
@@ -398,7 +426,7 @@ function renderForecast(forecast){
 
 async function loadForecast(){
   try{
-    const response = await fetch('/api/forecast');
+    const response = await authFetch('/api/forecast');
     renderForecast(await response.json());
   }catch(e){
     console.error('Forecast error:', e);
@@ -408,7 +436,7 @@ async function loadForecast(){
 
 async function loadCurrentData(){
   try{
-    const r = await fetch('/api/current_data');
+    const r = await authFetch('/api/current_data');
     const data = await r.json();
     applySensorData(data);
     if(data.last_update) lastUpdateTs = new Date(data.last_update).getTime();
@@ -417,7 +445,7 @@ async function loadCurrentData(){
 
 async function loadHistory(){
   try{
-    const response = await fetch('/api/history?limit=50');
+    const response = await authFetch('/api/history?limit=50');
     const data = await response.json();
     if(data && data.length>0){
       const reversed = data.reverse();
@@ -431,7 +459,7 @@ async function loadHistory(){
 
 async function loadAlerts(){
   try{
-    const response = await fetch('/api/alerts?limit=20');
+    const response = await authFetch('/api/alerts?limit=20');
     const alerts = await response.json();
     const alertsList = document.getElementById('alerts-list');
     const alertCount = document.getElementById('alert-count');
@@ -453,7 +481,7 @@ async function loadAlerts(){
 async function clearAlerts(){
   const btn = document.getElementById('clearAlertsBtn');
   btn.disabled = true; btn.textContent = 'Clearing…';
-  try{ await fetch('/api/clear_alerts', {method:'POST'}); await loadAlerts(); }
+  try{ await authFetch('/api/clear_alerts', {method:'POST'}); await loadAlerts(); }
   finally{ btn.disabled = false; btn.textContent = 'Clear All Alerts'; }
 }
 
@@ -466,7 +494,7 @@ async function sendChat(){
   msgs.innerHTML += `<div class="chat-msg chat-user">${escapeHtml(msg)}</div>`;
   msgs.scrollTop = msgs.scrollHeight;
   try{
-    const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
+    const r = await authFetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
     const data = await r.json();
     msgs.innerHTML += `<div class="chat-msg chat-bot">${data.reply}</div>`;
   }catch(e){
