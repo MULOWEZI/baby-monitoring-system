@@ -474,8 +474,7 @@ function renderForecast(forecast){
   if(forecast.warnings && forecast.warnings.temperature) warnings.push('<strong class="forecast-warning">Temperature may leave the normal range.</strong>');
   if(forecast.warnings && forecast.warnings.humidity) warnings.push('<strong class="forecast-warning">Humidity may leave the normal range.</strong>');
 
-  meta.innerHTML = `Based on ${forecast.samples} recent cloud-stored readings` +
-    (forecast.sample_window_minutes != null ? ` over approximately ${forecast.sample_window_minutes} minutes.` : '.') +
+  meta.innerHTML = `Based on the last 20 minutes of readings.` +
     (warnings.length ? ' ' + warnings.join(' ') : '');
 }
 
