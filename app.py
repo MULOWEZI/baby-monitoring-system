@@ -825,12 +825,18 @@ def send_alert_email_async(alerts):
 # ============================================================
 # ALERT STATE
 # ============================================================
-
 #
-# These variables prevent repeated alerts while the SAME
-# condition remains active.
-#
-# Example:
+# Alert "new event" detection compares the current reading against
+# the PREVIOUS reading actually stored in Supabase — not an in-memory
+# Python variable. This matters because this app can run under
+# multiple Gunicorn worker processes (and Render's free tier can
+# restart the dyno on inactivity). An in-memory global is scoped to a
+# single worker process and resets on every restart, so two workers
+# handling alternating requests — or a restart while the diaper is
+# still wet — would each see a "False -> True" transition and fire a
+# duplicate alert for a condition that never actually changed. Reading
+# the previous state from Supabase makes this correct regardless of
+# how many workers or restarts are involved.
 #
 # dry -> wet       = alert
 # wet -> wet       = nothing
@@ -840,11 +846,54 @@ def send_alert_email_async(alerts):
 # Same principle for temperature.
 # ============================================================
 
-alert_state_lock = threading.Lock()
 
-previous_wetness = False
+def get_previous_reading_state():
+    """
+    Fetch the most recently stored sensor reading's wetness and
+    abnormal-temperature flags from Supabase. Used as the baseline
+    for detecting state transitions, instead of in-memory globals
+    that don't survive worker restarts or exist across multiple
+    Gunicorn worker processes.
 
-previous_temperature_abnormal = False
+    Returns (previous_wetness: bool, previous_temperature_abnormal: bool).
+    Defaults to (False, False) when there is no prior reading or
+    Supabase is not configured.
+    """
+
+    if supabase is None:
+        return False, False
+
+    try:
+        response = (
+            supabase
+            .table("sensor_readings")
+            .select("wetness_detected,is_abnormal")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        rows = response.data or []
+
+        if not rows:
+            return False, False
+
+        row = rows[0]
+
+        return (
+            bool(row.get("wetness_detected", False)),
+            bool(row.get("is_abnormal", False)),
+        )
+
+    except Exception as e:
+        log.error(
+            "Failed to fetch previous reading state: %s",
+            e
+        )
+        # Fail safe: treat as "no previous abnormal condition" so a
+        # transient DB read error can't permanently suppress alerts,
+        # at worst causing one duplicate rather than silent misses.
+        return False, False
 
 
 # ============================================================
@@ -1109,11 +1158,20 @@ def check_alerts(
     temp,
     hum,
     wetness,
-    sound
+    sound,
+    previous_wetness,
+    previous_temperature_abnormal
 ):
 
     """
     Detect NEW alert events.
+
+    previous_wetness / previous_temperature_abnormal are the state
+    of the PREVIOUS stored reading, fetched from Supabase by the
+    caller (see get_previous_reading_state). This makes the
+    transition check correct across multiple Gunicorn workers and
+    server restarts, instead of relying on an in-memory global that
+    is only visible to a single process.
 
     WETNESS:
 
@@ -1137,10 +1195,6 @@ def check_alerts(
         Abnormal -> Normal
         = RESET
     """
-
-    global previous_wetness
-    global previous_temperature_abnormal
-
 
     # ========================================================
     # THRESHOLDS
@@ -1187,104 +1241,83 @@ def check_alerts(
 
 
     # ========================================================
-    # LOCK STATE CHANGES
+    # TEMPERATURE
     # ========================================================
 
-    with alert_state_lock:
+    new_temperature_event = (
+
+        temperature_abnormal
+
+        and
+
+        not previous_temperature_abnormal
+    )
 
 
-        # ----------------------------------------------------
-        # TEMPERATURE
-        # ----------------------------------------------------
+    if new_temperature_event:
 
-        new_temperature_event = (
+        if temp > temp_max:
 
-            temperature_abnormal
+            message = (
+                f"🌡️ Temperature is too high: "
+                f"{temp}°C. "
+                f"Configured maximum is "
+                f"{temp_max}°C."
+            )
 
-            and
+        elif temp < temp_min:
 
-            not previous_temperature_abnormal
-        )
+            message = (
+                f"🌡️ Temperature is too low: "
+                f"{temp}°C. "
+                f"Configured minimum is "
+                f"{temp_min}°C."
+            )
 
+        else:
 
-        if new_temperature_event:
-
-            if temp > temp_max:
-
-                message = (
-                    f"🌡️ Temperature is too high: "
-                    f"{temp}°C. "
-                    f"Configured maximum is "
-                    f"{temp_max}°C."
-                )
-
-            elif temp < temp_min:
-
-                message = (
-                    f"🌡️ Temperature is too low: "
-                    f"{temp}°C. "
-                    f"Configured minimum is "
-                    f"{temp_min}°C."
-                )
-
-            else:
-
-                message = (
-                    f"🌡️ Abnormal temperature detected: "
-                    f"{temp}°C."
-                )
+            message = (
+                f"🌡️ Abnormal temperature detected: "
+                f"{temp}°C."
+            )
 
 
-            alerts.append({
+        alerts.append({
 
-                "alert_type": "temperature",
+            "alert_type": "temperature",
 
-                "severity": "critical",
+            "severity": "critical",
 
-                "message": message
-            })
-
-
-        # Save current temperature state
-
-        previous_temperature_abnormal = (
-            temperature_abnormal
-        )
+            "message": message
+        })
 
 
-        # ----------------------------------------------------
-        # WET DIAPER
-        # ----------------------------------------------------
+    # ----------------------------------------------------
+    # WET DIAPER
+    # ----------------------------------------------------
 
-        new_wetness_event = (
+    new_wetness_event = (
 
-            current_wetness
+        current_wetness
 
-            and
+        and
 
-            not previous_wetness
-        )
-
-
-        if new_wetness_event:
-
-            alerts.append({
-
-                "alert_type": "wetness",
-
-                "severity": "critical",
-
-                "message":
-                    "💧 Diaper is wet! "
-                    "Please change the diaper."
-            })
+        not previous_wetness
+    )
 
 
-        # Save current wetness state
+    if new_wetness_event:
 
-        previous_wetness = (
-            current_wetness
-        )
+        alerts.append({
+
+            "alert_type": "wetness",
+
+            "severity": "critical",
+
+            "message":
+                "💧 Diaper is wet! "
+                "Please change the diaper."
+        })
 
 
     # ========================================================
@@ -1406,7 +1439,9 @@ def _process_reading_async(
     hum,
     motion,
     sound,
-    wetness
+    wetness,
+    previous_wetness,
+    previous_temperature_abnormal
 ):
     """
     Process alerts after the sensor reading has already been
@@ -1418,7 +1453,9 @@ def _process_reading_async(
             temp,
             hum,
             wetness,
-            sound
+            sound,
+            previous_wetness,
+            previous_temperature_abnormal
         )
     except Exception as e:
         log.error(
@@ -1594,10 +1631,14 @@ def api_test_email():
 # BASIC ENVIRONMENTAL FORECASTING
 # ============================================================
 
-# Forecasts use the most recent stored readings. Because the system
-# stores one reading every 5 seconds, 60 samples represent 5 minutes.
-FORECAST_SAMPLE_COUNT = 60
-FORECAST_HORIZONS_MINUTES = (5, 10, 15)
+# Forecasts use the most recent stored readings. The system stores one
+# reading every 5 seconds (12 per minute). To predict 60 minutes ahead,
+# the regression needs a window at least as long as the horizon itself
+# — extrapolating a straight line far past the data it was fit on
+# produces increasingly unreliable predictions. 720 samples covers the
+# last 60 minutes of stored readings.
+FORECAST_SAMPLE_COUNT = 720
+FORECAST_HORIZONS_MINUTES = (60,)
 
 # Use the same environmental limits as the alert system.
 # These were previously read directly inside alert functions, but the
@@ -2086,6 +2127,16 @@ def api_ingest():
         }), 200
 
     # --------------------------------------------------------
+    # READ PREVIOUS STATE BEFORE INSERTING THE NEW READING
+    # --------------------------------------------------------
+    # Must happen before the insert below, otherwise this would read
+    # back the reading we are about to save instead of the prior one.
+
+    previous_wetness, previous_temperature_abnormal = (
+        get_previous_reading_state()
+    )
+
+    # --------------------------------------------------------
     # SAVE ONE READING TO SUPABASE
     # --------------------------------------------------------
 
@@ -2182,7 +2233,9 @@ def api_ingest():
             hum,
             motion,
             sound,
-            wetness
+            wetness,
+            previous_wetness,
+            previous_temperature_abnormal
         ),
         daemon=True
     ).start()
