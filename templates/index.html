@@ -131,15 +131,18 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
    ENVIRONMENT FORECAST PANEL
    ============================================================ */
 .forecast-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;}
-.forecast-card{background:var(--bg);border:1px solid var(--border);border-radius:14px;padding:15px;}
-.forecast-card h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);margin-bottom:10px;}
-.forecast-current{font-size:1.55rem;font-weight:800;font-family:'Plus Jakarta Sans','Inter',sans-serif;margin-bottom:9px;}
-.forecast-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-top:1px solid var(--border);font-size:.75rem;}
-.forecast-row span:first-child{color:var(--text-muted);font-weight:600;}
-.forecast-value{font-weight:800;color:var(--text-primary);}
-.forecast-warning{color:var(--critical);font-weight:800;}
-.forecast-ok{color:var(--success);font-weight:800;}
-.forecast-meta{margin-top:12px;font-size:.68rem;color:var(--text-muted);}
+.forecast-card{background:var(--bg);border:1px solid var(--border);border-radius:14px;padding:18px 20px;}
+.forecast-card h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);margin-bottom:12px;}
+.forecast-compare{display:flex;align-items:center;gap:16px;}
+.forecast-now,.forecast-later{flex:1;}
+.forecast-arrow{color:var(--text-muted);font-size:1.1rem;flex-shrink:0;}
+.forecast-sublabel{font-size:.64rem;text-transform:uppercase;letter-spacing:.6px;color:var(--text-muted);font-weight:700;margin-bottom:4px;}
+.forecast-current{font-size:1.55rem;font-weight:800;font-family:'Plus Jakarta Sans','Inter',sans-serif;}
+.forecast-predicted{font-size:1.55rem;font-weight:800;font-family:'Plus Jakarta Sans','Inter',sans-serif;display:flex;align-items:center;gap:6px;}
+.forecast-delta{font-size:.68rem;font-weight:700;margin-top:2px;}
+.forecast-warning{color:var(--critical);}
+.forecast-ok{color:var(--success);}
+.forecast-meta{margin-top:14px;font-size:.68rem;color:var(--text-muted);}
 .forecast-empty{color:var(--text-muted);font-size:.8rem;padding:8px 0;}
 @media(max-width:650px){.forecast-grid{grid-template-columns:1fr;}}
 
@@ -317,6 +320,14 @@ document.getElementById('logoutBtn')?.addEventListener('click', logout);
 const socket = io();
 let lastUpdateTs = null;
 
+// Mirrors the backend's TEMP_MIN/TEMP_MAX/HUM_MIN/HUM_MAX defaults, used
+// only to color the forecast card. The actual alerting decision always
+// happens server-side against the real configured values.
+const TEMP_MIN_CLIENT = 20;
+const TEMP_MAX_CLIENT = 25;
+const HUM_MIN_CLIENT = 40;
+const HUM_MAX_CLIENT = 60;
+
 const hamburger = document.getElementById('hamburgerBtn');
 const sidebar = document.getElementById('sidebar');
 const overlay = document.getElementById('sidebarOverlay');
@@ -420,25 +431,44 @@ function renderForecast(forecast){
   const currentTemp = Number(forecast.current.temperature);
   const currentHumidity = Number(forecast.current.humidity);
 
-  const tempRows = (forecast.forecast.temperature || []).map(item => {
-    const value = Number(item.value);
-    const warning = value < 20 || value > 25;
-    return `<div class="forecast-row"><span>+${item.minutes_ahead} min</span>
-      <span class="forecast-value ${warning ? 'forecast-warning' : 'forecast-ok'}">${value.toFixed(2)} °C ${warning ? '⚠' : '✓'}</span></div>`;
-  }).join('');
+  // Only one horizon is expected now (60 min ahead), but fall back
+  // gracefully to the last entry if the API ever sends more than one.
+  const tempItems = forecast.forecast.temperature || [];
+  const humidityItems = forecast.forecast.humidity || [];
+  const tempPoint = tempItems[tempItems.length - 1];
+  const humidityPoint = humidityItems[humidityItems.length - 1];
 
-  const humidityRows = (forecast.forecast.humidity || []).map(item => {
-    const value = Number(item.value);
-    const warning = value < 40 || value > 60;
-    return `<div class="forecast-row"><span>+${item.minutes_ahead} min</span>
-      <span class="forecast-value ${warning ? 'forecast-warning' : 'forecast-ok'}">${value.toFixed(2)} % ${warning ? '⚠' : '✓'}</span></div>`;
-  }).join('');
+  function buildCard(label, unit, current, point, min, max){
+    if(!point){
+      return `<div class="forecast-card"><h3>${label}</h3><div class="forecast-empty">No prediction available.</div></div>`;
+    }
+    const predicted = Number(point.value);
+    const warning = predicted < min || predicted > max;
+    const delta = predicted - current;
+    const deltaSign = delta > 0 ? '+' : '';
+    const deltaClass = warning ? 'forecast-warning' : 'forecast-ok';
+    const icon = warning ? '⚠' : '✓';
+    return `
+      <div class="forecast-card">
+        <h3>${label}</h3>
+        <div class="forecast-compare">
+          <div class="forecast-now">
+            <div class="forecast-sublabel">Now</div>
+            <div class="forecast-current">${current.toFixed(1)}${unit}</div>
+          </div>
+          <div class="forecast-arrow">→</div>
+          <div class="forecast-later">
+            <div class="forecast-sublabel">In ${point.minutes_ahead} min</div>
+            <div class="forecast-predicted">${predicted.toFixed(1)}${unit} <span>${icon}</span></div>
+            <div class="forecast-delta ${deltaClass}">${deltaSign}${delta.toFixed(1)}${unit}</div>
+          </div>
+        </div>
+      </div>`;
+  }
 
-  container.innerHTML = `
-    <div class="forecast-card"><h3>Temperature</h3>
-      <div class="forecast-current">${currentTemp.toFixed(1)} °C</div>${tempRows}</div>
-    <div class="forecast-card"><h3>Humidity</h3>
-      <div class="forecast-current">${currentHumidity.toFixed(1)} %</div>${humidityRows}</div>`;
+  container.innerHTML =
+    buildCard('Temperature', ' °C', currentTemp, tempPoint, TEMP_MIN_CLIENT, TEMP_MAX_CLIENT) +
+    buildCard('Humidity', ' %', currentHumidity, humidityPoint, HUM_MIN_CLIENT, HUM_MAX_CLIENT);
 
   const warnings = [];
   if(forecast.warnings && forecast.warnings.temperature) warnings.push('<strong class="forecast-warning">Temperature may leave the normal range.</strong>');
