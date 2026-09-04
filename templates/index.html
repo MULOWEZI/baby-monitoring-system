@@ -102,6 +102,17 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
 .chat-user{background:var(--primary);color:#fff;align-self:flex-end;border-bottom-right-radius:4px;}
 .chat-bot{background:var(--surface);align-self:flex-start;border-bottom-left-radius:4px;border:1px solid var(--border);}
 .chat-bot strong{color:var(--primary);}
+.typing-indicator{display:flex;gap:4px;padding:11px 15px;}
+.typing-indicator span{width:6px;height:6px;border-radius:50%;background:var(--text-muted);animation:typingBounce 1.3s infinite;}
+.typing-indicator span:nth-child(2){animation-delay:.15s;}
+.typing-indicator span:nth-child(3){animation-delay:.3s;}
+@keyframes typingBounce{0%,60%,100%{transform:translateY(0);opacity:.4;}30%{transform:translateY(-4px);opacity:1;}}
+.chat-suggestions{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px;}
+.chip-btn{background:var(--primary-light);color:var(--primary-dark);border:1px solid transparent;padding:6px 13px;border-radius:30px;font-size:.72rem;font-weight:700;cursor:pointer;transition:var(--transition);font-family:inherit;}
+.chip-btn:hover{background:var(--primary);color:#fff;}
+.chip-btn:disabled{opacity:.5;cursor:not-allowed;}
+.chat-msg-time{font-size:.6rem;color:var(--text-muted);margin-top:4px;font-weight:600;}
+.chat-user .chat-msg-time{text-align:right;color:rgba(255,255,255,.7);}
 .chat-input-row{display:flex;gap:9px;}
 .chat-input-row input{flex:1;padding:11px 16px;border:1px solid var(--border);border-radius:12px;background:var(--bg);color:var(--text-primary);font-size:.83rem;outline:none;font-family:inherit;transition:var(--transition);}
 .chat-input-row input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-light);}
@@ -235,7 +246,7 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
     <div class="panel-header">
       <span class="dot-accent"></span>
       <h2>Environmental Forecast</h2>
-      <span class="sub">5 / 10 / 15 minutes ahead</span>
+      <span class="sub">60 minutes ahead</span>
     </div>
     <div id="forecast-content" class="forecast-grid">
       <div class="forecast-card">
@@ -263,9 +274,15 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
     <div class="chat-messages" id="chatMessages">
       <div class="chat-msg chat-bot">Hello! Ask me about <strong>temperature</strong>, <strong>humidity</strong>, <strong>motion</strong>, <strong>sound</strong>, or <strong>diaper</strong> status.</div>
     </div>
+    <div class="chat-suggestions" id="chatSuggestions">
+      <button type="button" class="chip-btn" data-q="Is the temperature okay?">🌡️ Temperature</button>
+      <button type="button" class="chip-btn" data-q="Is the humidity okay?">💧 Humidity</button>
+      <button type="button" class="chip-btn" data-q="Does the diaper need changing?">🚼 Diaper</button>
+      <button type="button" class="chip-btn" data-q="Is the baby moving?">🏃 Motion</button>
+    </div>
     <div class="chat-input-row">
       <input type="text" id="chatInput" placeholder="Ask about baby's status..." onkeydown="if(event.key==='Enter') sendChat()">
-      <button class="btn" onclick="sendChat()">Send</button>
+      <button class="btn" id="chatSendBtn" onclick="sendChat()">Send</button>
     </div>
   </div>
 
@@ -336,7 +353,8 @@ function escapeHtml(text){ const d=document.createElement('div'); d.textContent=
 // HTML/script — only the explicit **...** pattern is turned into markup.
 function renderBotReply(text){
   const escaped = escapeHtml(text);
-  return escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  const bolded = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  return bolded.replace(/\n/g, '<br>');
 }
 
 function applySensorData(data){
@@ -501,23 +519,71 @@ async function clearAlerts(){
   }
 }
 
-async function sendChat(){
-  const input = document.getElementById('chatInput');
-  const msg = input.value.trim();
-  if(!msg) return;
-  input.value = '';
+function chatTimeLabel(){
+  return new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function appendChatMsg(role, html){
   const msgs = document.getElementById('chatMessages');
-  msgs.innerHTML += `<div class="chat-msg chat-user">${escapeHtml(msg)}</div>`;
+  const el = document.createElement('div');
+  el.className = `chat-msg chat-${role}`;
+  el.innerHTML = `${html}<div class="chat-msg-time">${chatTimeLabel()}</div>`;
+  msgs.appendChild(el);
   msgs.scrollTop = msgs.scrollHeight;
-  try{
-    const r = await authFetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
-    const data = await r.json();
-    msgs.innerHTML += `<div class="chat-msg chat-bot">${renderBotReply(data.reply)}</div>`;
-  }catch(e){
-    msgs.innerHTML += `<div class="chat-msg chat-bot">Sorry, I couldn't reach the server.</div>`;
-  }
+  return el;
+}
+
+function showTypingIndicator(){
+  const msgs = document.getElementById('chatMessages');
+  const el = document.createElement('div');
+  el.className = 'chat-msg chat-bot';
+  el.id = 'typingIndicator';
+  el.innerHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
+  msgs.appendChild(el);
   msgs.scrollTop = msgs.scrollHeight;
 }
+
+function hideTypingIndicator(){
+  document.getElementById('typingIndicator')?.remove();
+}
+
+function setChatBusy(busy){
+  document.getElementById('chatInput').disabled = busy;
+  document.getElementById('chatSendBtn').disabled = busy;
+  document.querySelectorAll('#chatSuggestions .chip-btn').forEach(b => b.disabled = busy);
+}
+
+async function sendChat(overrideText){
+  const input = document.getElementById('chatInput');
+  const msg = (overrideText !== undefined ? overrideText : input.value).trim();
+  if(!msg) return;
+  input.value = '';
+
+  appendChatMsg('user', escapeHtml(msg));
+  setChatBusy(true);
+  showTypingIndicator();
+
+  try{
+    const r = await authFetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
+    hideTypingIndicator();
+    if(!r.ok){
+      appendChatMsg('bot', `Sorry, something went wrong on my end (status ${r.status}). Try again in a moment.`);
+    } else {
+      const data = await r.json();
+      appendChatMsg('bot', renderBotReply(data.reply || "Sorry, I didn't get a reply."));
+    }
+  }catch(e){
+    hideTypingIndicator();
+    appendChatMsg('bot', "Sorry, I couldn't reach the server. Check your connection and try again.");
+  } finally {
+    setChatBusy(false);
+    input.focus();
+  }
+}
+
+document.querySelectorAll('#chatSuggestions .chip-btn').forEach(btn=>{
+  btn.addEventListener('click', () => sendChat(btn.dataset.q));
+});
 
 socket.on('sensor_update', (data)=>{ applySensorData(data); pushChartPoint(data); lastUpdateTs = Date.now(); });
 socket.on('environment_forecast', (data)=>{ renderForecast(data); });
@@ -558,7 +624,7 @@ loadHistory();
 loadAlerts();
 loadForecast();
 setInterval(()=>{ loadHistory(); loadAlerts(); }, 30000);
-setInterval(loadForecast, 30000);
+setInterval(loadForecast, 150000);
 </script>
 </body>
 </html>
