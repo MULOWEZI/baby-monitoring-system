@@ -331,6 +331,14 @@ const chart = new Chart(ctx, {
 function getStatusClass(value,min,max){ if(value==null) return 'status-normal'; if(value<min||value>max) return 'status-critical'; if(value<min+2||value>max-2) return 'status-warning'; return 'status-normal'; }
 function escapeHtml(text){ const d=document.createElement('div'); d.textContent=text; return d.innerHTML; }
 
+// Converts simple **bold** Markdown from the assistant's reply into real
+// <strong> tags. Text is escaped first so the bot can't inject arbitrary
+// HTML/script — only the explicit **...** pattern is turned into markup.
+function renderBotReply(text){
+  const escaped = escapeHtml(text);
+  return escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+}
+
 function applySensorData(data){
   document.getElementById('temp').textContent = data.temperature || '--';
   document.getElementById('humidity').textContent = data.humidity || '--';
@@ -480,8 +488,17 @@ async function loadAlerts(){
 async function clearAlerts(){
   const btn = document.getElementById('clearAlertsBtn');
   btn.disabled = true; btn.textContent = 'Clearing…';
-  try{ await authFetch('/api/clear_alerts', {method:'POST'}); await loadAlerts(); }
-  finally{ btn.disabled = false; btn.textContent = 'Clear All Alerts'; }
+  try{
+    const r = await authFetch('/api/clear_alerts', {method:'POST'});
+    if(!r.ok){
+      console.error('Clear alerts failed with status', r.status);
+    }
+    await loadAlerts();
+  } catch(e){
+    console.error('Clear alerts error:', e);
+  } finally{
+    btn.disabled = false; btn.textContent = 'Clear All Alerts';
+  }
 }
 
 async function sendChat(){
@@ -495,7 +512,7 @@ async function sendChat(){
   try{
     const r = await authFetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg})});
     const data = await r.json();
-    msgs.innerHTML += `<div class="chat-msg chat-bot">${data.reply}</div>`;
+    msgs.innerHTML += `<div class="chat-msg chat-bot">${renderBotReply(data.reply)}</div>`;
   }catch(e){
     msgs.innerHTML += `<div class="chat-msg chat-bot">Sorry, I couldn't reach the server.</div>`;
   }
