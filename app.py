@@ -440,7 +440,7 @@ def should_commit_sensor_reading():
 
 
 # ============================================================
-# VIDEO STREAMING
+# VIDEO STREAMING (legacy JPEG / MJPEG path)
 # ============================================================
 
 latest_frame = None
@@ -479,6 +479,164 @@ def _broadcast_frame(frame):
                 except queue.Full:
 
                     pass
+
+
+# ============================================================
+# H.264 / FRAGMENTED MP4 VIDEO STREAMING
+# ============================================================
+#
+# This is a second, separate video path alongside the JPEG/MJPEG one
+# above. The Pi encodes H.264 and muxes it into fragmented MP4 (fMP4)
+# using ffmpeg, then POSTs:
+#   - ONE "init segment" (the ftyp+moov boxes) once, when it starts
+#   - a continuous stream of "fragments" (moof+mdat box pairs) after
+#
+# Unlike JPEG frames, fMP4 fragments must NOT be dropped/skipped for a
+# given viewer - doing so corrupts that viewer's decode from that
+# point on (unlike a still image, where showing a slightly stale frame
+# is harmless). So fragment queues here are sized generously and we
+# only ever drop for a specific subscriber that is falling behind
+# (never for the others), accepting that a lagging viewer's video may
+# glitch until their next page load/reconnect (which re-fetches the
+# init segment and starts clean).
+# ============================================================
+
+_video_init_segment = None
+
+_video_init_lock = threading.Lock()
+
+_video_fragment_subscribers = []
+
+_video_fragment_subscribers_lock = threading.Lock()
+
+
+def _broadcast_video_fragment(fragment):
+
+    with _video_fragment_subscribers_lock:
+
+        for q in _video_fragment_subscribers:
+
+            try:
+
+                q.put_nowait(fragment)
+
+            except queue.Full:
+
+                # Deliberately do NOT drop-and-replace here like the
+                # JPEG path does. Silently skipping this fragment for
+                # this one slow subscriber is the least-bad option -
+                # their stream may glitch, but other viewers are
+                # unaffected, and this subscriber will self-correct on
+                # their next reconnect (fresh init segment + fragments).
+                pass
+
+
+@app.route(
+    "/api/upload_video_init",
+    methods=["POST"]
+)
+def api_upload_video_init():
+    """
+    Receives the one-time fMP4 initialization segment (ftyp+moov boxes)
+    from the Pi. Sent once when the Pi's video pipeline (re)starts, and
+    cached so any browser connecting to /video_stream_mp4 - even ones
+    joining well after the Pi started - can be sent it immediately
+    before their live fragment stream begins.
+    """
+
+    global _video_init_segment
+
+    data = request.get_data()
+
+    if not data:
+        return jsonify({
+            "status": "error",
+            "error": "Empty init segment"
+        }), 400
+
+    with _video_init_lock:
+        _video_init_segment = data
+
+    log.info(
+        "VIDEO INIT: received fMP4 init segment (%d bytes)",
+        len(data)
+    )
+
+    return jsonify({"status": "ok"})
+
+
+@app.route(
+    "/api/upload_video_fragment",
+    methods=["POST"]
+)
+def api_upload_video_fragment():
+    """
+    Receives one fMP4 fragment (a complete moof+mdat box pair) from the
+    Pi and relays it live to every connected /video_stream_mp4 viewer.
+    """
+
+    data = request.get_data()
+
+    if not data:
+        return jsonify({
+            "status": "error",
+            "error": "Empty fragment"
+        }), 400
+
+    _broadcast_video_fragment(data)
+
+    return jsonify({"status": "ok"})
+
+
+@app.route(
+    "/video_stream_mp4"
+)
+@login_required
+def video_stream_mp4():
+    """
+    Live H.264 video as a continuous fragmented-MP4 byte stream.
+
+    Point a <video> element's src directly at this endpoint - modern
+    Chrome/Firefox can play a growing/fragmented MP4 delivered over a
+    chunked HTTP response as progressive playback, no MediaSource
+    Extensions JavaScript required. (Safari support for this is more
+    limited - see the frontend notes.)
+    """
+
+    def generate():
+
+        q = queue.Queue(maxsize=60)
+
+        with _video_fragment_subscribers_lock:
+            _video_fragment_subscribers.append(q)
+
+        try:
+
+            with _video_init_lock:
+                init = _video_init_segment
+
+            if not init:
+                # No video pipeline has connected yet.
+                return
+
+            yield init
+
+            while True:
+
+                fragment = q.get()
+
+                yield fragment
+
+        finally:
+
+            with _video_fragment_subscribers_lock:
+                if q in _video_fragment_subscribers:
+                    _video_fragment_subscribers.remove(q)
+
+    return Response(
+        generate(),
+        mimetype="video/mp4"
+    )
 
 
 # ============================================================
@@ -539,394 +697,6 @@ def email_configuration_status():
 # ============================================================
 
 def send_alert_email(alerts):
-    """
-    Send one transactional email for a newly detected alert event.
-
-    Bird returns 202 when the message has been accepted for
-    asynchronous delivery. That is treated as a successful send
-    request. Actual delivery can subsequently be checked in Bird.
-    """
-
-    if not alerts:
-        log.warning("EMAIL: no alerts supplied")
-        return False
-
-    # --------------------------------------------------------
-    # Validate configuration
-    # --------------------------------------------------------
-
-    if not BIRD_API_KEY:
-        log.error(
-            "EMAIL: BIRD_API_KEY is missing"
-        )
-        return False
-
-    if not BIRD_SENDER:
-        log.error(
-            "EMAIL: BIRD_SENDER is missing"
-        )
-        return False
-
-    if not ALERT_EMAIL:
-        log.error(
-            "EMAIL: ALERT_EMAIL is missing"
-        )
-        return False
-
-    host = bird_host()
-    endpoint = f"{host}/v1/email/messages"
-
-    log.info(
-        "EMAIL: preparing Bird send | host=%s | from=%s | to=%s",
-        host,
-        BIRD_SENDER,
-        ALERT_EMAIL
-    )
-
-    # --------------------------------------------------------
-    # Determine subject
-    # --------------------------------------------------------
-
-    alert_types = {
-        alert.get("alert_type")
-        for alert in alerts
-    }
-
-    if "wetness" in alert_types:
-        subject = "Wet Diaper Detected"
-    elif "temperature" in alert_types:
-        subject = "Temperature Alert"
-    else:
-        subject = "Baby Monitoring Alert"
-
-    # --------------------------------------------------------
-    # Build HTML + plain text
-    # --------------------------------------------------------
-
-    html_items = []
-    text_items = []
-
-    for alert in alerts:
-        severity = str(
-            alert.get("severity", "warning")
-        ).upper()
-
-        message = str(
-            alert.get("message", "")
-        )
-
-        html_items.append(
-            f"<li><strong>{severity}</strong> — {message}</li>"
-        )
-
-        text_items.append(
-            f"{severity} — {message}"
-        )
-
-    # Use Lusaka time for the email timestamp.
-    from zoneinfo import ZoneInfo
-
-    timestamp = datetime.now(
-        ZoneInfo("Africa/Lusaka")
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S CAT"
-    )
-
-    html = f"""
-    <!doctype html>
-    <html>
-      <body>
-        <h2>Baby Cradle Monitoring Alert</h2>
-
-        <p>
-          A new condition requiring attention was detected.
-        </p>
-
-        <p>
-          <strong>Time:</strong> {timestamp}
-        </p>
-
-        <ul>
-          {''.join(html_items)}
-        </ul>
-
-        <p>
-          Please check the baby monitoring dashboard.
-        </p>
-
-        <p>
-          <a href="https://baby-monitoring-system.onrender.com">
-            Open Baby Monitoring Dashboard
-          </a>
-        </p>
-      </body>
-    </html>
-    """
-
-    plain_text = (
-        "Baby Cradle Monitoring Alert\n\n"
-        "A new condition requiring attention was detected.\n\n"
-        f"Time: {timestamp}\n\n"
-        + "\n".join(text_items)
-        + "\n\nPlease check the baby monitoring dashboard.\n"
-    )
-
-    # --------------------------------------------------------
-    # Bird payload
-    # --------------------------------------------------------
-
-    payload = {
-        "from": BIRD_SENDER,
-        "to": [ALERT_EMAIL],
-        "subject": subject,
-        "html": html,
-        "text": plain_text,
-        # Alerts are transactional messages, not marketing.
-        "category": "transactional"
-    }
-
-    # --------------------------------------------------------
-    # Send
-    # --------------------------------------------------------
-
-    try:
-
-        log.info(
-            "EMAIL: POST %s",
-            endpoint
-        )
-
-        log.info(
-            "EMAIL: starting outbound Bird HTTP request"
-        )
-
-        response = requests.post(
-            endpoint,
-            headers={
-                "Authorization": f"Bearer {BIRD_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=20
-        )
-
-        log.info(
-            "EMAIL: outbound Bird HTTP request completed"
-        )
-
-        response_text = response.text[:1000]
-
-        log.info(
-            "EMAIL: Bird response status=%s body=%s",
-            response.status_code,
-            response_text
-        )
-
-        if response.status_code == 202:
-
-            try:
-                result = response.json()
-            except ValueError:
-                result = {}
-
-            message_id = result.get("id")
-
-            log.info(
-                "EMAIL: accepted by Bird | message_id=%s | recipient=%s",
-                message_id,
-                ALERT_EMAIL
-            )
-
-            return True
-
-        # Bird documents field-validation failures as 422 and
-        # authentication failures as 401/403. Log them explicitly.
-        if response.status_code == 401:
-            log.error(
-                "EMAIL: Bird rejected the API key (401). "
-                "Check BIRD_API_KEY and its region."
-            )
-
-        elif response.status_code == 403:
-            log.error(
-                "EMAIL: Bird denied the API operation (403). "
-                "Check the API key permissions/scopes."
-            )
-
-        elif response.status_code == 421:
-            log.error(
-                "EMAIL: wrong Bird regional host (421). "
-                "Check the region encoded in BIRD_API_KEY."
-            )
-
-        elif response.status_code == 422:
-            log.error(
-                "EMAIL: Bird rejected the email request (422). "
-                "Check sender verification, recipient restrictions, "
-                "and payload fields."
-            )
-
-        elif response.status_code == 429:
-            log.error(
-                "EMAIL: Bird rate/usage limit reached (429)."
-            )
-
-        else:
-            log.error(
-                "EMAIL: Bird send failed with HTTP %s",
-                response.status_code
-            )
-
-    except requests.Timeout:
-        log.error(
-            "EMAIL: Bird request timed out after 20 seconds"
-        )
-
-    except requests.RequestException as e:
-        log.error(
-            "EMAIL: network error while contacting Bird: %s",
-            e
-        )
-
-    except Exception as e:
-        log.exception(
-            "EMAIL: unexpected email error: %s",
-            e
-        )
-
-    return False
-
-
-def send_alert_email_async(alerts):
-    """
-    Run email delivery outside the sensor request/alert logic so
-    a slow or failed email provider never blocks sensor ingestion.
-    """
-
-    try:
-        success = send_alert_email(alerts)
-
-        if success:
-            log.info(
-                "EMAIL: alert email processing completed successfully"
-            )
-        else:
-            log.error(
-                "EMAIL: alert email was NOT accepted by Bird"
-            )
-
-    except Exception as e:
-        log.exception(
-            "EMAIL: background worker failed: %s",
-            e
-        )
-
-
-# ============================================================
-# ALERT STATE
-# ============================================================
-#
-# Alert "new event" detection compares the current reading against
-# the PREVIOUS reading actually stored in Supabase — not an in-memory
-# Python variable. This matters because this app can run under
-# multiple Gunicorn worker processes (and Render's free tier can
-# restart the dyno on inactivity). An in-memory global is scoped to a
-# single worker process and resets on every restart, so two workers
-# handling alternating requests — or a restart while the diaper is
-# still wet — would each see a "False -> True" transition and fire a
-# duplicate alert for a condition that never actually changed. Reading
-# the previous state from Supabase makes this correct regardless of
-# how many workers or restarts are involved.
-#
-# dry -> wet       = alert
-# wet -> wet       = nothing
-# wet -> dry       = reset
-# dry -> wet       = alert again
-#
-# Same principle for temperature.
-# ============================================================
-
-
-def get_previous_reading_state():
-    """
-    Fetch the most recently stored sensor reading's wetness and
-    abnormal-temperature flags from Supabase. Used as the baseline
-    for detecting state transitions, instead of in-memory globals
-    that don't survive worker restarts or exist across multiple
-    Gunicorn worker processes.
-
-    Returns (previous_wetness: bool, previous_temperature_abnormal: bool).
-    Defaults to (False, False) when there is no prior reading or
-    Supabase is not configured.
-    """
-
-    if supabase is None:
-        return False, False
-
-    try:
-        response = (
-            supabase
-            .table("sensor_readings")
-            .select("wetness_detected,is_abnormal")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        rows = response.data or []
-
-        if not rows:
-            return False, False
-
-        row = rows[0]
-
-        return (
-            bool(row.get("wetness_detected", False)),
-            bool(row.get("is_abnormal", False)),
-        )
-
-    except Exception as e:
-        log.error(
-            "Failed to fetch previous reading state: %s",
-            e
-        )
-        # Fail safe: treat as "no previous abnormal condition" so a
-        # transient DB read error can't permanently suppress alerts,
-        # at worst causing one duplicate rather than silent misses.
-        return False, False
-
-
-# ============================================================
-# BIRD HOST
-# ============================================================
-
-def bird_host():
-
-    """
-    Derive Bird platform host from the API key region.
-
-    Example:
-        bk_us1_xxxxx
-        -> https://us1.platform.bird.com
-    """
-
-    parts = BIRD_API_KEY.split("_")
-
-    region = (
-        parts[1]
-        if len(parts) > 1 and parts[1]
-        else "us1"
-    )
-
-    return f"https://{region}.platform.bird.com"
-
-
-# ============================================================
-# SEND EMAIL
-# ============================================================
-
-def send_alert_email(alerts):
-
     """
     Sends one email containing the supplied alerts.
 
@@ -1102,6 +872,132 @@ def send_alert_email(alerts):
     return False
 
 
+def send_alert_email_async(alerts):
+    """
+    Run email delivery outside the sensor request/alert logic so
+    a slow or failed email provider never blocks sensor ingestion.
+    """
+
+    try:
+        success = send_alert_email(alerts)
+
+        if success:
+            log.info(
+                "EMAIL: alert email processing completed successfully"
+            )
+        else:
+            log.error(
+                "EMAIL: alert email was NOT accepted by Bird"
+            )
+
+    except Exception as e:
+        log.exception(
+            "EMAIL: background worker failed: %s",
+            e
+        )
+
+
+# ============================================================
+# ALERT STATE
+# ============================================================
+#
+# Alert "new event" detection compares the current reading against
+# the PREVIOUS reading actually stored in Supabase — not an in-memory
+# Python variable. This matters because this app can run under
+# multiple Gunicorn worker processes (and Render's free tier can
+# restart the dyno on inactivity). An in-memory global is scoped to a
+# single worker process and resets on every restart, so two workers
+# handling alternating requests — or a restart while the diaper is
+# still wet — would each see a "False -> True" transition and fire a
+# duplicate alert for a condition that never actually changed. Reading
+# the previous state from Supabase makes this correct regardless of
+# how many workers or restarts are involved.
+#
+# dry -> wet       = alert
+# wet -> wet       = nothing
+# wet -> dry       = reset
+# dry -> wet       = alert again
+#
+# Same principle for temperature.
+# ============================================================
+
+
+def get_previous_reading_state():
+    """
+    Fetch the most recently stored sensor reading's wetness and
+    abnormal-temperature flags from Supabase. Used as the baseline
+    for detecting state transitions, instead of in-memory globals
+    that don't survive worker restarts or exist across multiple
+    Gunicorn worker processes.
+
+    Returns (previous_wetness: bool, previous_temperature_abnormal: bool).
+    Defaults to (False, False) when there is no prior reading or
+    Supabase is not configured.
+    """
+
+    if supabase is None:
+        return False, False
+
+    try:
+        response = (
+            supabase
+            .table("sensor_readings")
+            .select("temperature,wetness_detected")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        rows = response.data or []
+
+        if not rows:
+            return False, False
+
+        row = rows[0]
+
+        # IMPORTANT:
+        # is_abnormal represents temperature OR humidity.
+        # Therefore it must NOT be used as the previous
+        # temperature state.
+        try:
+            previous_temp = float(row.get("temperature"))
+        except (TypeError, ValueError):
+            previous_temp = None
+
+        try:
+            temp_min = float(os.getenv("TEMP_MIN", "20"))
+        except (TypeError, ValueError):
+            temp_min = 20.0
+
+        try:
+            temp_max = float(os.getenv("TEMP_MAX", "25"))
+        except (TypeError, ValueError):
+            temp_max = 25.0
+
+        previous_temperature_abnormal = (
+            previous_temp is not None
+            and (
+                previous_temp < temp_min
+                or previous_temp > temp_max
+            )
+        )
+
+        return (
+            bool(row.get("wetness_detected", False)),
+            previous_temperature_abnormal,
+        )
+
+    except Exception as e:
+        log.error(
+            "Failed to fetch previous reading state: %s",
+            e
+        )
+        # Fail safe: treat as "no previous abnormal condition" so a
+        # transient DB read error can't permanently suppress alerts,
+        # at worst causing one duplicate rather than silent misses.
+        return False, False
+
+
 # ============================================================
 # TEMPERATURE / HUMIDITY CHECK
 # ============================================================
@@ -1154,6 +1050,12 @@ def check_abnormal(temp, hum):
 # EVENT-BASED ALERT LOGIC
 # ============================================================
 
+# True after the first temperature reading has been processed
+# by this server process. This allows an abnormal temperature
+# present at startup to trigger an alert once.
+_temperature_alert_initialized = False
+
+
 def check_alerts(
     temp,
     hum,
@@ -1162,6 +1064,7 @@ def check_alerts(
     previous_wetness,
     previous_temperature_abnormal
 ):
+    global _temperature_alert_initialized
 
     """
     Detect NEW alert events.
@@ -1244,17 +1147,56 @@ def check_alerts(
     # TEMPERATURE
     # ========================================================
 
+    # Temperature alert rules:
+    #
+    # First reading after server startup:
+    #     abnormal -> ALERT
+    #
+    # Normal -> abnormal:
+    #     ALERT
+    #
+    # Abnormal -> abnormal:
+    #     NO NEW ALERT
+    #
+    # Abnormal -> normal:
+    #     RESET, so a later abnormal reading alerts again.
     new_temperature_event = (
-
         temperature_abnormal
-
         and
-
-        not previous_temperature_abnormal
+        (
+            not _temperature_alert_initialized
+            or
+            not previous_temperature_abnormal
+        )
     )
 
+    _temperature_alert_initialized = True
+
+
+    if temperature_abnormal:
+        log.info(
+            "TEMPERATURE CHECK: %.1f°C | SAFE RANGE: %.1f–%.1f°C | ABNORMAL",
+            temp,
+            temp_min,
+            temp_max
+        )
+    else:
+        log.info(
+            "TEMPERATURE CHECK: %.1f°C | SAFE RANGE: %.1f–%.1f°C | NORMAL",
+            temp,
+            temp_min,
+            temp_max
+        )
 
     if new_temperature_event:
+
+        log.warning(
+            "TEMPERATURE ALERT TRIGGERED: %.1f°C "
+            "is outside %.1f–%.1f°C",
+            temp,
+            temp_min,
+            temp_max
+        )
 
         if temp > temp_max:
 
@@ -2256,7 +2198,7 @@ def api_ingest():
 
 # ============================================================
 # ============================================================
-# VIDEO FRAME UPLOAD
+# VIDEO FRAME UPLOAD (legacy JPEG path)
 # ============================================================
 
 @app.route(
@@ -2303,7 +2245,7 @@ def api_upload_frame():
 
 
 # ============================================================
-# LIVE VIDEO STREAM
+# LIVE VIDEO STREAM (legacy JPEG / MJPEG path)
 # ============================================================
 
 @app.route(
