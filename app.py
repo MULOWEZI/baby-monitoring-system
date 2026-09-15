@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 
 import os
 import sys
@@ -464,115 +464,113 @@ def check_alerts(
     wetness,
     sound
 ):
-
     """
-    Detect NEW alert events.
-
-    WETNESS:
-
-        False -> True
-        = NEW EVENT
-
-        True -> True
-        = NO NEW EVENT
-
-        True -> False
-        = RESET
+    Check temperature and wetness independently.
 
     TEMPERATURE:
+        - Normal -> abnormal: alert immediately.
+        - Abnormal -> abnormal: repeat after TEMP_ALERT_COOLDOWN.
+        - Abnormal -> normal: reset the cooldown.
+        - If the first reading after server startup is abnormal,
+          it is treated as a new alert.
 
-        Normal -> Abnormal
-        = NEW EVENT
-
-        Abnormal -> Abnormal
-        = NO NEW EVENT
-
-        Abnormal -> Normal
-        = RESET
+    WETNESS:
+        - Dry -> wet: alert immediately.
+        - Wet -> wet: no repeated alert.
+        - Wet -> dry: reset.
     """
 
     global previous_wetness
     global previous_temperature_abnormal
-
+    global last_temperature_alert_time
 
     # ========================================================
     # THRESHOLDS
     # ========================================================
 
-    temp_min = float(
-        os.getenv("TEMP_MIN", 20)
-    )
-
-    temp_max = float(
-        os.getenv("TEMP_MAX", 25)
-    )
-
-
-    alerts = []
-
-
-    # ========================================================
-    # CURRENT TEMPERATURE STATE
-    # ========================================================
-
-    temperature_abnormal = False
+    try:
+        temp_min = float(os.getenv("TEMP_MIN", "20"))
+    except (TypeError, ValueError):
+        temp_min = 20.0
 
     try:
-        temp_value = (
-            float(temp)
-            if temp is not None
-            else None
+        temp_max = float(os.getenv("TEMP_MAX", "25"))
+    except (TypeError, ValueError):
+        temp_max = 25.0
+
+    try:
+        temperature_cooldown = float(
+            os.getenv("TEMP_ALERT_COOLDOWN", "300")
         )
+    except (TypeError, ValueError):
+        temperature_cooldown = 300.0
+
+    if temperature_cooldown < 0:
+        temperature_cooldown = 0.0
+
+    # ========================================================
+    # NORMALIZE TEMPERATURE
+    # ========================================================
+
+    try:
+        temp_value = float(temp)
     except (TypeError, ValueError):
         temp_value = None
 
-    if temp_value is not None:
+    temperature_abnormal = False
 
+    if temp_value is not None:
         temperature_abnormal = (
             temp_value < temp_min
             or
             temp_value > temp_max
         )
 
+    # ========================================================
+    # NORMALIZE WETNESS
+    # ========================================================
+
+    # Handle both real booleans and common string values.
+    if isinstance(wetness, str):
+        current_wetness = wetness.strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "wet",
+            "on"
+        )
+    else:
+        current_wetness = bool(wetness)
 
     # ========================================================
-    # WETNESS STATE
+    # DEBUG LOG
     # ========================================================
 
-    current_wetness = bool(
-        wetness
+    log.info(
+        "TEMPERATURE CHECK: %s°C | SAFE RANGE: %.1f–%.1f°C | "
+        "ABNORMAL: %s",
+        (
+            f"{temp_value:.1f}"
+            if temp_value is not None
+            else "INVALID"
+        ),
+        temp_min,
+        temp_max,
+        temperature_abnormal
     )
 
+    # ========================================================
+    # COLLECT NEW ALERT EVENTS
+    # ========================================================
 
-    # ========================================================
-    # LOCK STATE CHANGES
-    # ========================================================
+    temperature_alert = None
+    wetness_alert = None
 
     with alert_state_lock:
 
-
         # ----------------------------------------------------
-        # TEMPERATURE
-        #
-        # Improved behaviour:
-        #   Normal -> abnormal : alert immediately
-        #   Abnormal -> abnormal : repeat after cooldown
-        #   Abnormal -> normal : reset the cooldown
-        #
-        # This also allows a fresh alert after a server restart.
+        # TEMPERATURE ALERT
         # ----------------------------------------------------
-
-        global last_temperature_alert_time
-
-        try:
-            temperature_cooldown = float(
-                os.getenv("TEMP_ALERT_COOLDOWN", "300")
-            )
-        except (TypeError, ValueError):
-            temperature_cooldown = 300.0
-
-        if temperature_cooldown < 0:
-            temperature_cooldown = 0.0
 
         now = time.time()
 
@@ -583,7 +581,7 @@ def check_alerts(
             >= temperature_cooldown
         )
 
-        new_temperature_event = (
+        temperature_event = (
             temperature_abnormal
             and
             (
@@ -593,10 +591,9 @@ def check_alerts(
             )
         )
 
-        if new_temperature_event:
+        if temperature_event:
 
             if temp_value > temp_max:
-
                 message = (
                     f"🌡️ Temperature is too high: "
                     f"{temp_value:.1f}°C. "
@@ -605,7 +602,6 @@ def check_alerts(
                 )
 
             elif temp_value < temp_min:
-
                 message = (
                     f"🌡️ Temperature is too low: "
                     f"{temp_value:.1f}°C. "
@@ -614,131 +610,161 @@ def check_alerts(
                 )
 
             else:
-
                 message = (
                     f"🌡️ Abnormal temperature detected: "
                     f"{temp_value:.1f}°C."
                 )
 
-            alerts.append({
-
+            temperature_alert = {
                 "alert_type": "temperature",
-
                 "severity": "critical",
-
                 "message": message
-            })
+            }
 
             last_temperature_alert_time = now
 
             log.warning(
-                "TEMPERATURE ALERT: %.1f°C "
-                "(safe range %.1f–%.1f°C, cooldown %.0fs)",
-                temp_value,
-                temp_min,
-                temp_max,
-                temperature_cooldown
+                "TEMPERATURE ALERT CREATED: %s",
+                message
             )
 
         elif not temperature_abnormal:
-
-            # Temperature returned to normal.
-            # The next abnormal reading will alert immediately.
+            # Returning to normal resets the repeat-alert timer.
             last_temperature_alert_time = None
 
         previous_temperature_abnormal = temperature_abnormal
 
-
         # ----------------------------------------------------
-        # WET DIAPER
+        # WET DIAPER ALERT
         # ----------------------------------------------------
 
-        new_wetness_event = (
-
+        wetness_event = (
             current_wetness
-
             and
-
             not previous_wetness
         )
 
+        if wetness_event:
 
-        if new_wetness_event:
-
-            alerts.append({
-
+            wetness_alert = {
                 "alert_type": "wetness",
-
                 "severity": "critical",
-
                 "message":
                     "💧 Diaper is wet! "
                     "Please change the diaper."
-            })
+            }
 
+            log.warning(
+                "WETNESS ALERT CREATED: Diaper is wet."
+            )
 
-        # Save current wetness state
-
-        previous_wetness = (
-            current_wetness
-        )
-
+        previous_wetness = current_wetness
 
     # ========================================================
-    # NO NEW EVENTS
+    # PROCESS TEMPERATURE ALERT SEPARATELY
     # ========================================================
 
-    if not alerts:
+    if temperature_alert is not None:
 
-        return
-
-
-    # ========================================================
-    # SAVE ALERTS TO SUPABASE
-    # ========================================================
-
-    if supabase is not None:
-
-        for alert in alerts:
+        # Save temperature alert to Supabase.
+        if supabase is not None:
 
             try:
-
                 supabase.table(
                     "alerts"
                 ).insert(
-                    alert
+                    temperature_alert
                 ).execute()
 
-
-                # Immediately update dashboard
-
-                socketio.emit(
-                    "new_alert",
-                    alert
-                )
-
-
                 log.info(
-                    "NEW ALERT: %s",
-                    alert["message"]
+                    "Temperature alert saved to Supabase."
                 )
-
 
             except Exception as e:
 
                 log.error(
-                    "Supabase alert insert error: %s",
+                    "Temperature alert DB error: %s",
                     e
                 )
 
+        # Send temperature email independently.
+        email_sent = send_alert_email(
+            [temperature_alert]
+        )
+
+        if email_sent:
+            log.info(
+                "Temperature alert email sent successfully."
+            )
+        else:
+            log.error(
+                "Temperature alert email was NOT sent."
+            )
+
+        # Update dashboard independently.
+        try:
+            socketio.emit(
+                "new_alert",
+                temperature_alert
+            )
+        except Exception as e:
+            log.error(
+                "Temperature Socket.IO alert error: %s",
+                e
+            )
 
     # ========================================================
-    # SEND ONE EMAIL FOR THE NEW EVENT
+    # PROCESS WETNESS ALERT SEPARATELY
     # ========================================================
 
-    send_alert_email(
-        alerts
-    )
+    if wetness_alert is not None:
+
+        # Save wetness alert to Supabase.
+        if supabase is not None:
+
+            try:
+                supabase.table(
+                    "alerts"
+                ).insert(
+                    wetness_alert
+                ).execute()
+
+                log.info(
+                    "Wetness alert saved to Supabase."
+                )
+
+            except Exception as e:
+
+                log.error(
+                    "Wetness alert DB error: %s",
+                    e
+                )
+
+        # Send wetness email independently.
+        email_sent = send_alert_email(
+            [wetness_alert]
+        )
+
+        if email_sent:
+            log.info(
+                "Wetness alert email sent successfully."
+            )
+        else:
+            log.error(
+                "Wetness alert email was NOT sent."
+            )
+
+        # Update dashboard independently.
+        try:
+            socketio.emit(
+                "new_alert",
+                wetness_alert
+            )
+        except Exception as e:
+            log.error(
+                "Wetness Socket.IO alert error: %s",
+                e
+            )
 
 
 # ============================================================
@@ -1697,10 +1723,8 @@ if __name__ == "__main__":
     )
 
 
-    debug = (
-        os.getenv("RENDER")
-        is None
-    )
+    # Keep the monitoring server stable on the Raspberry Pi.
+    debug = False
 
 
     try:
@@ -1750,7 +1774,6 @@ if __name__ == "__main__":
 
         port=port,
 
-        debug=debug,
-
+        debug=False,
+        use_reloader=False,
         allow_unsafe_werkzeug=True
-    )
