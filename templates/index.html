@@ -267,12 +267,6 @@ h1,h2,.brand-text h2,.card-value,.nav-link,.stat-num{font-family:'Plus Jakarta S
   </div>
 
   <div class="panel panel-full">
-    <div class="panel-header"><span class="dot-accent"></span><h2>Recent Alerts</h2><span class="sub" id="alert-count">0 alerts</span></div>
-    <div id="alerts-list"></div>
-    <button class="btn" id="clearAlertsBtn" onclick="clearAlerts()" style="margin-top:14px;">Clear All Alerts</button>
-  </div>
-
-  <div class="panel panel-full">
     <div class="panel-header"><span class="dot-accent"></span><h2>Assistant</h2><span class="sub">Ask about baby's status</span></div>
     <div class="chat-messages" id="chatMessages">
       <div class="chat-msg chat-bot">Hello! Ask me about <strong>temperature</strong>, <strong>humidity</strong>, <strong>motion</strong>, <strong>sound</strong>, or <strong>diaper</strong> status.</div>
@@ -616,7 +610,6 @@ document.querySelectorAll('#chatSuggestions .chip-btn').forEach(btn=>{
 
 socket.on('sensor_update', (data)=>{ applySensorData(data); pushChartPoint(data); lastUpdateTs = Date.now(); });
 socket.on('environment_forecast', (data)=>{ renderForecast(data); });
-socket.on('new_alert', ()=>{ loadAlerts(); });
 
 const connIndicator = document.getElementById('conn-indicator');
 const connStatus = document.getElementById('conn-status');
@@ -650,9 +643,8 @@ dashCam.onerror = ()=>{ dashCam.style.display='none'; dashCamEmpty.style.display
 
 loadCurrentData();
 loadHistory();
-loadAlerts();
 loadForecast();
-setInterval(()=>{ loadHistory(); loadAlerts(); }, 30000);
+setInterval(()=>{ loadHistory(); }, 30000);
 setInterval(loadForecast, 150000);
 </script>
 </body>
